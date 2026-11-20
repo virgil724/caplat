@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: CLI and core
+        run: |
+          go vet ./...
+          go test ./...
+          go build -o caplat.exe ./cmd/caplat
+      - name: Other platforms still compile
+        shell: bash
+        run: |
+          GOOS=linux go vet ./...
+          GOOS=windows GOARCH=arm64 go vet ./...
+
+  gui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gui/go.mod
+      - name: GUI
+        working-directory: gui
+        run: |
+          go vet .
+          go test .
+          go build -ldflags "-H=windowsgui" -o caplat-gui.exe .
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, gui]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gui/go.mod
+      - name: Build
+        shell: bash
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -trimpath -o dist/caplat-windows-$arch.exe ./cmd/caplat
+            (cd gui && GOARCH=$arch go build -trimpath -ldflags "-H=windowsgui" -o ../dist/caplat-gui-windows-$arch.exe .)
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
