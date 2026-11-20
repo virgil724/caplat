@@ -36,6 +36,8 @@ func main() {
 		err = list(os.Args[2:])
 	case "run":
 		err = run(os.Args[2:])
+	case "audio":
+		err = runAudio(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -56,6 +58,7 @@ func usage() {
 usage:
   caplat list [--ffmpeg PATH]
   caplat run [flags]          (caplat run -h for flags)
+  caplat audio [flags]        audio latency (caplat audio -h for flags)
 
 Connect an HDMI output of this PC to the card's input and extend the desktop
 onto it. Press Esc or click the barcode window to stop early.
@@ -85,6 +88,18 @@ func list(args []string) error {
 			t = "  [" + strings.Join(tags, ", ") + "]"
 		}
 		fmt.Printf("  %-14s %-22s %s%s\n", d.Name, d.Mode(), d.FriendlyName, t)
+	}
+	if outs, err := caplat.AudioOutputs(); err == nil {
+		fmt.Println("\nAudio outputs:")
+		for _, n := range outs {
+			fmt.Printf("  %q\n", n)
+		}
+	}
+	if ins, err := caplat.AudioInputs(); err == nil {
+		fmt.Println("\nAudio inputs:")
+		for _, n := range ins {
+			fmt.Printf("  %q\n", n)
+		}
 	}
 	ctx := context.Background()
 	devs, err := caplat.Devices(ctx, *ff)
@@ -248,4 +263,49 @@ func printResult(r caplat.Result) {
 		fmt.Printf("  vblank -> driver timestamp:  %s\n", caplat.FormatStats(d))
 		fmt.Printf("  driver timestamp -> caplat:  p50 %.1f ms (rest of the frame over USB, driver, Media Foundation)\n", r.Total.P50-d.P50)
 	}
+}
+
+func runAudio(args []string) error {
+	fs := flag.NewFlagSet("audio", flag.ExitOnError)
+	var cfg caplat.AudioConfig
+	fs.StringVar(&cfg.Backend, "backend", caplat.AudioWASAPI, "capture backend: wasapi (in-process; also reports the driver's timestamp) or ffmpeg (DirectShow through ffmpeg)")
+	fs.StringVar(&cfg.Output, "output", "", "audio output feeding the card, or part of its name (default: the one that looks like the card)")
+	fs.StringVar(&cfg.Input, "input", "", "the card's audio input, or part of its name (default: the one that looks like the card)")
+	fs.StringVar(&cfg.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering: low-latency or default")
+	fs.StringVar(&cfg.FFmpeg, "ffmpeg", "", "ffmpeg binary (default: ffmpeg on PATH)")
+	fs.DurationVar(&cfg.Duration, "duration", 30*time.Second, "how long to measure (0 = until Ctrl+C)")
+	fs.DurationVar(&cfg.Interval, "interval", 10*time.Second, "print statistics every interval")
+	csvPath := fs.String("csv", "", "write every chirp to this CSV file")
+	fs.Parse(args)
+	if *csvPath != "" {
+		f, err := os.Create(*csvPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		cfg.CSV = f
+	}
+	cfg.OnInterval = func(iv caplat.AudioInterval) {
+		line := fmt.Sprintf("[%s-%s] %s", round(iv.Start), round(iv.End), caplat.FormatStats(iv.Delivered))
+		if iv.Device.N > 0 {
+			line += fmt.Sprintf("  | to driver timestamp p50 %.1f", iv.Device.P50)
+		}
+		fmt.Println(line)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	fmt.Println("measuring audio: a 10 ms chirp every 500 ms... (Ctrl+C to stop)")
+	res, err := caplat.RunAudio(ctx, cfg)
+	fmt.Printf("output   %q (%s)\ninput    %q via %s\n", res.Output, res.OutputFormat, res.Input, res.Backend)
+	if len(res.FFmpegArgs) > 0 {
+		fmt.Printf("ffmpeg   %s\n", strings.Join(res.FFmpegArgs, " "))
+	}
+	if res.Matched > 0 {
+		fmt.Printf("\naudio latency, chirp played -> caplat has it, over %s\n  %s\n", round(res.Elapsed), caplat.FormatStats(res.Delivered))
+		if d := res.Device; d.N > 0 {
+			fmt.Printf("  chirp played -> driver's capture timestamp:  %s\n", caplat.FormatStats(d))
+		}
+		fmt.Printf("  chirps played %d, found %d, paired %d\n", res.Emitted, res.Detected, res.Matched)
+	}
+	return err
 }
