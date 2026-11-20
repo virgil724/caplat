@@ -63,8 +63,10 @@ the capture starts, plus about a frame of jitter.
 
 Over minutes the low-latency capture of the GC553 sometimes steps from
 35 ms to 52 ms, exactly one frame more, and stays there until the capture is
-restarted. It happened at random (after 15 s in one run, 95 s in another, not
-at all in a third), and every time a short CPU stall triggered it on purpose.
+restarted. It happens on its own (after about 15 s in one run, 95 s in
+another, not at all in a 90 s run) and also right after a deliberate CPU
+stall; once it has happened, further stalls cause long spikes but no second
+step.
 Shrinking ffmpeg's real-time buffer (`-rtbufsize 2M`) does not prevent it,
 so the extra frame is queued below ffmpeg, in DirectShow or the driver. Any
 software reading the card this way can carry that frame; a long `--interval`
