@@ -15,7 +15,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/virgil724/caplat/internal/capture"
+	"github.com/virgil724/caplat/capture"
 	"github.com/virgil724/caplat/internal/win"
 )
 

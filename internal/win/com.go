@@ -8,6 +8,7 @@ package win
 
 import (
 	"fmt"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -75,4 +76,15 @@ func hr(r uintptr) error {
 		return HRESULT(r)
 	}
 	return nil
+}
+
+// WithCOM runs f on a locked OS thread with COM initialized (multithreaded).
+func WithCOM(f func() error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := COInitMultithreaded(); err != nil {
+		return fmt.Errorf("COM: %w", err)
+	}
+	defer COUninit()
+	return f()
 }

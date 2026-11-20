@@ -8,82 +8,25 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"runtime"
-	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/windows"
 
+	"github.com/virgil724/caplat/capture/wasapi"
 	"github.com/virgil724/caplat/internal/win"
 )
 
-func withCOM(f func() error) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if err := win.COInitMultithreaded(); err != nil {
-		return fmt.Errorf("COM: %w", err)
-	}
-	defer win.COUninit()
-	return f()
-}
-
 // Endpoints lists the active endpoints' names; capture selects inputs.
 func Endpoints(capture bool) ([]string, error) {
-	flow := win.ERender
 	if capture {
-		flow = win.ECapture
+		return wasapi.Inputs()
 	}
-	var names []string
-	err := withCOM(func() error {
-		eps, err := win.AudioEndpoints(flow)
-		for _, e := range eps {
-			names = append(names, e.Name)
-			e.Device.Release()
-		}
-		return err
-	})
-	return names, err
+	return wasapi.Outputs()
 }
 
-// FindName returns the one name equal to want, or else containing it
-// (case-insensitive).
-func FindName(names []string, want string) (string, error) {
-	var hits []string
-	for _, n := range names {
-		if strings.EqualFold(n, want) {
-			return n, nil
-		}
-		if strings.Contains(strings.ToLower(n), strings.ToLower(want)) {
-			hits = append(hits, n)
-		}
-	}
-	switch len(hits) {
-	case 1:
-		return hits[0], nil
-	case 0:
-		return "", fmt.Errorf("no audio endpoint matches %q; have %q", want, names)
-	}
-	return "", fmt.Errorf("%q matches several endpoints: %q", want, hits)
-}
-
-func openEndpoint(flow int, name string) (win.Object, error) {
-	eps, err := win.AudioEndpoints(flow)
-	if err != nil {
-		return 0, err
-	}
-	var dev win.Object
-	for _, e := range eps {
-		if dev == 0 && e.Name == name {
-			dev = e.Device
-			continue
-		}
-		e.Device.Release()
-	}
-	if dev == 0 {
-		return 0, fmt.Errorf("audio endpoint %q not found", name)
-	}
-	return dev, nil
-}
+// FindName returns the one name equal to want, or else containing it.
+func FindName(names []string, want string) (string, error) { return wasapi.FindName(names, want) }
 
 // worker is a goroutine on a locked COM thread that runs until stopped.
 type worker struct {
@@ -112,7 +55,7 @@ func (w *worker) stopped() bool {
 func (w *worker) start(run func(ready chan<- error) error) error {
 	ready := make(chan error, 1)
 	go func() {
-		err := withCOM(func() error { return run(ready) })
+		err := win.WithCOM(func() error { return run(ready) })
 		select {
 		case ready <- err:
 		default:
@@ -159,12 +102,12 @@ func StartPlayer(cfg PlayerConfig, freq int64, onEmit func(Emitted)) (*Player, e
 }
 
 func (p *Player) run(cfg PlayerConfig, freq int64, onEmit func(Emitted), ready chan<- error) error {
-	dev, err := openEndpoint(win.ERender, cfg.Endpoint)
+	dev, err := win.OpenEndpoint(win.ERender, cfg.Endpoint)
 	if err != nil {
 		return err
 	}
 	defer dev.Release()
-	ac, err := win.NewAudioClient(dev, 300000) // 30 ms
+	ac, err := win.NewAudioClient(dev, 300000, 0) // 30 ms
 	if err != nil {
 		return fmt.Errorf("%s: %w", cfg.Endpoint, err)
 	}
@@ -284,120 +227,28 @@ func putSample(b []byte, f win.WaveFormat, v float64) {
 	}
 }
 
-func getSample(b []byte, f win.WaveFormat) float64 {
-	switch {
-	case f.Float:
-		return float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))
-	case f.Bits == 16:
-		return float64(int16(binary.LittleEndian.Uint16(b))) / 32768
-	case f.Bits == 24:
-		return float64(int32(uint32(b[0])<<8|uint32(b[1])<<16|uint32(b[2])<<24)>>8) / 8388608
-	default:
-		return float64(int32(binary.LittleEndian.Uint32(b))) / 2147483648
-	}
-}
-
-// Packet is a run of captured samples.
-type Packet struct {
-	Start  int64 // index of its first sample in the stream
-	Frames int
-	// DeviceQPC is when its first sample was captured, per the driver (QPC
-	// ticks; 0 if unknown).
-	DeviceQPC int64
-	// Arrive is when caplat got it (QPC ticks).
-	Arrive int64
-}
-
-// OnSamples receives mono samples (the first channel) and their packet.
-type OnSamples func(x []float64, p Packet)
-
-// WASAPICapture reads an input endpoint in shared mode, event-driven.
-type WASAPICapture struct {
-	worker
-	rate int
-}
+// WASAPICapture adapts the public WASAPI capture to mono samples.
+type WASAPICapture struct{ *wasapi.Capture }
 
 // Rate is the capture's sample rate.
-func (c *WASAPICapture) Rate() int { return c.rate }
+func (c *WASAPICapture) Rate() int { return c.Capture.Rate }
 
-// StartWASAPI starts capturing; onSamples runs on the capture thread.
-func StartWASAPI(endpoint string, now func() int64, freq int64, onSamples OnSamples) (*WASAPICapture, error) {
-	c := &WASAPICapture{worker: newWorker()}
-	err := c.start(func(ready chan<- error) error { return c.run(endpoint, now, freq, onSamples, ready) })
+// StartWASAPI starts capturing endpoint, asking for an engine period of
+// period (0 = default); onSamples runs on the capture thread.
+func StartWASAPI(endpoint string, period time.Duration, exclusive bool, now func() int64, freq int64, onSamples OnSamples) (*WASAPICapture, error) {
+	var mono []float64
+	c, err := wasapi.Start(wasapi.Config{Endpoint: endpoint, Period: period, Exclusive: exclusive}, now, freq, func(p wasapi.Packet) {
+		ch := len(p.Samples) / max(p.Frames, 1)
+		mono = mono[:0]
+		for i := 0; i < p.Frames; i++ {
+			mono = append(mono, float64(p.Samples[i*ch]))
+		}
+		onSamples(mono, Packet{Start: p.Start, Frames: p.Frames, DeviceQPC: p.DeviceQPC, Arrive: p.Arrive})
+	})
 	if err != nil {
 		return nil, err
 	}
-	return c, nil
+	return &WASAPICapture{c}, nil
 }
 
-func (c *WASAPICapture) run(endpoint string, now func() int64, freq int64, onSamples OnSamples, ready chan<- error) error {
-	dev, err := openEndpoint(win.ECapture, endpoint)
-	if err != nil {
-		return err
-	}
-	defer dev.Release()
-	ac, err := win.NewAudioClient(dev, 1000000) // 100 ms of room; packets come every period
-	if err != nil {
-		return fmt.Errorf("%s: %w", endpoint, err)
-	}
-	defer ac.Close()
-	cc, err := ac.Service(&win.IID_IAudioCaptureClient)
-	if err != nil {
-		return err
-	}
-	defer cc.Release()
-	f := ac.Format
-	c.rate = f.Rate
-	if err := ac.Start(); err != nil {
-		return err
-	}
-	defer ac.Stop()
-	ready <- nil
-
-	var idx int64
-	var mono []float64
-	for !c.stopped() {
-		ev, _ := windows.WaitForSingleObject(ac.Event, 200)
-		if ev != windows.WAIT_OBJECT_0 {
-			return errors.New("the audio input stopped signalling (no signal or device removed?)")
-		}
-		for {
-			n, err := win.NextPacketSize(cc)
-			if err != nil {
-				return err
-			}
-			if n == 0 {
-				break
-			}
-			pk, err := win.CaptureGet(cc, f.BlockAlign)
-			arrive := now()
-			if err != nil {
-				return err
-			}
-			mono = mono[:0]
-			for i := 0; i < pk.Frames; i++ {
-				v := 0.0
-				if pk.Flags&win.BufferFlagsSilent == 0 && pk.Data != nil {
-					v = getSample(pk.Data[i*f.BlockAlign:], f)
-				}
-				mono = append(mono, v)
-			}
-			p := Packet{Start: idx, Frames: pk.Frames, Arrive: arrive}
-			if pk.Flags&win.BufferFlagsTimestampErr == 0 && pk.QPC != 0 {
-				p.DeviceQPC = hnsToQPC(pk.QPC, freq)
-			}
-			win.CaptureRelease(cc, pk.Frames)
-			idx += int64(pk.Frames)
-			onSamples(mono, p)
-		}
-	}
-	return nil
-}
-
-// hnsToQPC converts 100 ns units of QPC time to QPC ticks.
-func hnsToQPC(hns, freq int64) int64 {
-	if freq == 10_000_000 {
-		return hns
-	}
-	return hns/10_000_000*freq + hns%10_000_000*freq/10_000_000
-}
+func hnsToQPC(hns, freq int64) int64 { return wasapi.HNSToQPC(hns, freq) }

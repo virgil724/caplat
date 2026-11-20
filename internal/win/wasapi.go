@@ -4,6 +4,7 @@ package win
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -21,6 +22,7 @@ var procPropVariantClear = modOle32.NewProc("PropVariantClear")
 var (
 	CLSID_MMDeviceEnumerator = guid(0xbcde0395, 0xe52f, 0x467c, 0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e)
 	IID_IMMDeviceEnumerator  = guid(0xa95664d2, 0x9614, 0x4f35, 0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6)
+	IID_IAudioClient3        = guid(0x7ed4ee07, 0x8e67, 0x4cd4, 0x8c, 0x1a, 0x2b, 0x7a, 0x59, 0x87, 0xad, 0x42)
 	IID_IAudioClient         = guid(0x1cb9ad4c, 0xdbfa, 0x4c32, 0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2)
 	IID_IAudioRenderClient   = guid(0xf294acfc, 0x3146, 0x4483, 0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2)
 	IID_IAudioCaptureClient  = guid(0xc8adbd64, 0xe71e, 0x48a0, 0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17)
@@ -44,27 +46,33 @@ const (
 )
 
 const (
-	vtEnumAudioEndpoints = 3 // IMMDeviceEnumerator
-	vtCollectionCount    = 3 // IMMDeviceCollection
-	vtCollectionItem     = 4
-	vtDeviceActivate     = 3 // IMMDevice
-	vtOpenPropertyStore  = 4
-	vtPropStoreGetValue  = 5 // IPropertyStore
-	vtACInitialize       = 3 // IAudioClient
-	vtACGetBufferSize    = 4
-	vtACGetPadding       = 6
-	vtACGetMixFormat     = 8
-	vtACStart            = 10
-	vtACStop             = 11
-	vtACSetEventHandle   = 13
-	vtACGetService       = 14
-	vtRCGetBuffer        = 3 // IAudioRenderClient
-	vtRCReleaseBuffer    = 4
-	vtCCGetBuffer        = 3 // IAudioCaptureClient
-	vtCCReleaseBuffer    = 4
-	vtCCNextPacketSize   = 5
-	vtClockFrequency     = 3 // IAudioClock
-	vtClockPosition      = 4
+	vtEnumAudioEndpoints  = 3 // IMMDeviceEnumerator
+	vtCollectionCount     = 3 // IMMDeviceCollection
+	vtCollectionItem      = 4
+	vtDeviceActivate      = 3 // IMMDevice
+	vtOpenPropertyStore   = 4
+	vtPropStoreGetValue   = 5 // IPropertyStore
+	vtACInitialize        = 3 // IAudioClient
+	vtACGetBufferSize     = 4
+	vtACGetPadding        = 6
+	vtACIsFormatSupported = 7
+	vtACGetMixFormat      = 8
+	vtACGetDevicePeriod   = 9
+	vtACStart             = 10
+	vtACStop              = 11
+	vtACSetEventHandle    = 13
+	vtACGetService        = 14
+	// IAudioClient3 (after IAudioClient2's IsOffloadCapable,
+	// SetClientProperties, GetBufferSizeLimits).
+	vtAC3GetSharedModeEnginePeriod = 18
+	vtAC3InitializeShared          = 20
+	vtRCGetBuffer                  = 3 // IAudioRenderClient
+	vtRCReleaseBuffer              = 4
+	vtCCGetBuffer                  = 3 // IAudioCaptureClient
+	vtCCReleaseBuffer              = 4
+	vtCCNextPacketSize             = 5
+	vtClockFrequency               = 3 // IAudioClock
+	vtClockPosition                = 4
 )
 
 type propertyKey struct {
@@ -180,48 +188,215 @@ type AudioClient struct {
 	Object
 	Format WaveFormat
 	Frames int // buffer size in frames
+	Period int // engine period in frames with IAudioClient3; 0 = the default
 	Event  windows.Handle
 }
 
 // NewAudioClient activates and initializes an endpoint in shared mode with
 // its mix format, signalling Event each period. buffer is in 100 ns units.
-func NewAudioClient(device Object, buffer int64) (*AudioClient, error) {
+//
+// With period > 0 (frames) it first tries IAudioClient3's low-latency
+// shared mode at the smallest engine period that is at least period and
+// that the driver allows; Period reports what was used (0 = the default
+// period, about 10 ms).
+func NewAudioClient(device Object, buffer int64, period int) (*AudioClient, error) {
+	if period > 0 {
+		if c, err := newAudioClient3(device, period); err == nil {
+			return c, nil
+		}
+	}
 	var ac Object
 	if err := hr(device.call(vtDeviceActivate, uintptr(unsafe.Pointer(&IID_IAudioClient)), 1, 0, uintptr(unsafe.Pointer(&ac)))); err != nil {
 		return nil, fmt.Errorf("activate: %w", err)
 	}
 	c := &AudioClient{Object: ac}
-	var mix *byte
-	if err := hr(ac.call(vtACGetMixFormat, uintptr(unsafe.Pointer(&mix)))); err != nil {
-		ac.Release()
-		return nil, fmt.Errorf("mix format: %w", err)
-	}
-	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(mix)))
-	f, err := parseWaveFormat(mix)
+	mix, err := c.mixFormat()
 	if err != nil {
 		ac.Release()
 		return nil, err
 	}
-	c.Format = f
-	const eventCallback = 0x00040000
+	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(mix)))
 	if err := hr(ac.call(vtACInitialize, 0, eventCallback, uintptr(buffer), 0, uintptr(unsafe.Pointer(mix)), 0)); err != nil {
 		ac.Release()
 		return nil, fmt.Errorf("initialize: %w", err)
 	}
-	var frames uint32
-	ac.call(vtACGetBufferSize, uintptr(unsafe.Pointer(&frames)))
-	c.Frames = int(frames)
-	ev, err := windows.CreateEvent(nil, 0, 0, nil)
+	return c, c.finish()
+}
+
+const eventCallback = 0x00040000 // AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+
+// errBufferNotAligned is AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED.
+const errBufferNotAligned HRESULT = 0x88890019
+
+// NewExclusiveClient opens an endpoint in exclusive mode, bypassing the
+// audio engine, with an event every period (100 ns units; raised to the
+// device's minimum). It uses the first format the device accepts among its
+// mix format and 16-, 24- (in 32) and 32-bit PCM at the mix rate and
+// channel count. Period reports the period in frames.
+func NewExclusiveClient(device Object, period int64) (*AudioClient, error) {
+	probe, err := activateClient(device)
+	if err != nil {
+		return nil, err
+	}
+	mix, err := probe.mixFormat()
+	if err != nil {
+		probe.Release()
+		return nil, err
+	}
+	mf := probe.Format
+	var def, min int64
+	probe.call(vtACGetDevicePeriod, uintptr(unsafe.Pointer(&def)), uintptr(unsafe.Pointer(&min)))
+	period = max(period, min)
+	var fmtBytes []byte
+	mixLen := 18 + int(binary.LittleEndian.Uint16(unsafe.Slice(mix, 18)[16:])) // + cbSize
+	cands := [][]byte{unsafe.Slice(mix, mixLen), waveFormatPCM(mf.Rate, mf.Channels, 16, 16),
+		waveFormatPCM(mf.Rate, mf.Channels, 32, 24), waveFormatPCM(mf.Rate, mf.Channels, 32, 32)}
+	for _, cand := range cands {
+		if probe.call(vtACIsFormatSupported, 1, uintptr(unsafe.Pointer(&cand[0])), 0) == 0 {
+			fmtBytes = append([]byte(nil), cand...)
+			break
+		}
+	}
+	procCoTaskMemFree.Call(uintptr(unsafe.Pointer(mix)))
+	probe.Release()
+	if fmtBytes == nil {
+		return nil, errors.New("the device accepts none of the tried exclusive formats")
+	}
+	f, err := parseWaveFormat(&fmtBytes[0])
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		c, err := activateClient(device)
+		if err != nil {
+			return nil, err
+		}
+		c.Format = f
+		r := c.call(vtACInitialize, 1, eventCallback, uintptr(period), uintptr(period), uintptr(unsafe.Pointer(&fmtBytes[0])), 0)
+		if HRESULT(r) == errBufferNotAligned && attempt == 0 {
+			// Use the aligned buffer size the device reports.
+			var frames uint32
+			c.call(vtACGetBufferSize, uintptr(unsafe.Pointer(&frames)))
+			c.Release()
+			period = int64(float64(frames)*1e7/float64(f.Rate) + 0.5)
+			continue
+		}
+		if err := hr(r); err != nil {
+			c.Release()
+			return nil, fmt.Errorf("exclusive initialize: %w", err)
+		}
+		c.Period = int(period * int64(f.Rate) / 1e7)
+		return c, c.finish()
+	}
+	return nil, errors.New("exclusive initialize: buffer not aligned")
+}
+
+func activateClient(device Object) (*AudioClient, error) {
+	var ac Object
+	if err := hr(device.call(vtDeviceActivate, uintptr(unsafe.Pointer(&IID_IAudioClient)), 1, 0, uintptr(unsafe.Pointer(&ac)))); err != nil {
+		return nil, fmt.Errorf("activate: %w", err)
+	}
+	return &AudioClient{Object: ac}, nil
+}
+
+// waveFormatPCM builds a WAVEFORMATEXTENSIBLE for integer PCM.
+func waveFormatPCM(rate, channels, bits, valid int) []byte {
+	b := make([]byte, 40)
+	block := channels * bits / 8
+	binary.LittleEndian.PutUint16(b[0:], 0xfffe)
+	binary.LittleEndian.PutUint16(b[2:], uint16(channels))
+	binary.LittleEndian.PutUint32(b[4:], uint32(rate))
+	binary.LittleEndian.PutUint32(b[8:], uint32(rate*block))
+	binary.LittleEndian.PutUint16(b[12:], uint16(block))
+	binary.LittleEndian.PutUint16(b[14:], uint16(bits))
+	binary.LittleEndian.PutUint16(b[16:], 22)
+	binary.LittleEndian.PutUint16(b[18:], uint16(valid))
+	mask := uint32(3) // front left and right
+	if channels == 1 {
+		mask = 4 // front center
+	}
+	binary.LittleEndian.PutUint32(b[20:], mask)
+	binary.LittleEndian.PutUint32(b[24:], subtypePCM.Data1)
+	binary.LittleEndian.PutUint16(b[28:], subtypePCM.Data2)
+	binary.LittleEndian.PutUint16(b[30:], subtypePCM.Data3)
+	copy(b[32:], subtypePCM.Data4[:])
+	return b
+}
+
+// mixFormat reads and parses the mix format; free the result with
+// CoTaskMemFree.
+func (c *AudioClient) mixFormat() (*byte, error) {
+	var mix *byte
+	if err := hr(c.call(vtACGetMixFormat, uintptr(unsafe.Pointer(&mix)))); err != nil {
+		return nil, fmt.Errorf("mix format: %w", err)
+	}
+	f, err := parseWaveFormat(mix)
+	if err != nil {
+		procCoTaskMemFree.Call(uintptr(unsafe.Pointer(mix)))
+		return nil, err
+	}
+	c.Format = f
+	return mix, nil
+}
+
+func newAudioClient3(device Object, want int) (*AudioClient, error) {
+	var ac Object
+	if err := hr(device.call(vtDeviceActivate, uintptr(unsafe.Pointer(&IID_IAudioClient3)), 1, 0, uintptr(unsafe.Pointer(&ac)))); err != nil {
+		return nil, err
+	}
+	c := &AudioClient{Object: ac}
+	mix, err := c.mixFormat()
 	if err != nil {
 		ac.Release()
 		return nil, err
 	}
-	c.Event = ev
-	if err := hr(ac.call(vtACSetEventHandle, uintptr(ev))); err != nil {
-		c.Close()
+	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(mix)))
+	var def, fund, lo, hi uint32
+	if err := hr(ac.call(vtAC3GetSharedModeEnginePeriod, uintptr(unsafe.Pointer(mix)), uintptr(unsafe.Pointer(&def)),
+		uintptr(unsafe.Pointer(&fund)), uintptr(unsafe.Pointer(&lo)), uintptr(unsafe.Pointer(&hi)))); err != nil || fund == 0 {
+		ac.Release()
+		return nil, fmt.Errorf("engine periods: %v", err)
+	}
+	p := SharedPeriod(want, int(fund), int(lo), int(hi))
+	if p >= int(def) { // no smaller than the default: use the plain path
+		ac.Release()
+		return nil, errors.New("no period below the default")
+	}
+	if err := hr(ac.call(vtAC3InitializeShared, eventCallback, uintptr(p), uintptr(unsafe.Pointer(mix)), 0)); err != nil {
+		ac.Release()
 		return nil, err
 	}
-	return c, nil
+	c.Period = p
+	return c, c.finish()
+}
+
+// SharedPeriod picks the engine period for a wanted one: a multiple of
+// fund within [lo, hi], the smallest that is at least want.
+func SharedPeriod(want, fund, lo, hi int) int {
+	p := max(want, lo)
+	if r := (p - lo) % fund; r != 0 {
+		p += fund - r
+	}
+	return min(p, hi)
+}
+
+// finish reads the buffer size and sets up the event of an initialized
+// client; it releases the client on failure.
+func (c *AudioClient) finish() error {
+	var frames uint32
+	c.call(vtACGetBufferSize, uintptr(unsafe.Pointer(&frames)))
+	c.Frames = int(frames)
+	ev, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		c.Release()
+		return err
+	}
+	c.Event = ev
+	if err := hr(c.call(vtACSetEventHandle, uintptr(ev))); err != nil {
+		c.Close()
+		return err
+	}
+	return nil
 }
 
 // Close releases the client and its event.
@@ -307,4 +482,24 @@ func ClockFrequency(clk Object) (uint64, error) {
 func ClockPosition(clk Object) (pos, qpc uint64, err error) {
 	err = hr(clk.call(vtClockPosition, uintptr(unsafe.Pointer(&pos)), uintptr(unsafe.Pointer(&qpc))))
 	return pos, qpc, err
+}
+
+// OpenEndpoint returns the active endpoint of flow named name; Release it.
+func OpenEndpoint(flow int, name string) (Object, error) {
+	eps, err := AudioEndpoints(flow)
+	if err != nil {
+		return 0, err
+	}
+	var dev Object
+	for _, e := range eps {
+		if dev == 0 && e.Name == name {
+			dev = e.Device
+			continue
+		}
+		e.Device.Release()
+	}
+	if dev == 0 {
+		return 0, fmt.Errorf("audio endpoint %q not found", name)
+	}
+	return dev, nil
 }

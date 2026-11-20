@@ -276,6 +276,8 @@ func runAudio(args []string) error {
 	fs.StringVar(&cfg.Input, "input", "", "the card's audio input, or part of its name (default: the one that looks like the card)")
 	fs.StringVar(&cfg.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering: low-latency or default")
 	fs.StringVar(&cfg.FFmpeg, "ffmpeg", "", "ffmpeg binary (default: ffmpeg on PATH)")
+	fs.BoolVar(&cfg.Exclusive, "exclusive", false, "wasapi: capture in exclusive mode (the device's minimum period, often 3 ms)")
+	fs.DurationVar(&cfg.Period, "period", 0, "wasapi: ask for a shorter capture engine period, e.g. 3ms (IAudioClient3; 0 = default 10 ms)")
 	fs.DurationVar(&cfg.Duration, "duration", 30*time.Second, "how long to measure (0 = until Ctrl+C)")
 	fs.DurationVar(&cfg.Interval, "interval", 10*time.Second, "print statistics every interval")
 	csvPath := fs.String("csv", "", "write every chirp to this CSV file")
@@ -300,6 +302,13 @@ func runAudio(args []string) error {
 	fmt.Println("measuring audio: a 10 ms chirp every 500 ms... (Ctrl+C to stop)")
 	res, err := caplat.RunAudio(ctx, cfg)
 	fmt.Printf("output   %q (%s)\ninput    %q via %s\n", res.Output, res.OutputFormat, res.Input, res.Backend)
+	if res.Backend == caplat.AudioWASAPI {
+		p := "default (about 10 ms)"
+		if res.InputPeriod > 0 {
+			p = res.InputPeriod.String()
+		}
+		fmt.Printf("period   %s\n", p)
+	}
 	if len(res.FFmpegArgs) > 0 {
 		fmt.Printf("ffmpeg   %s\n", strings.Join(res.FFmpegArgs, " "))
 	}

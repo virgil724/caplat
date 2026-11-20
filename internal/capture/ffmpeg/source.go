@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/virgil724/caplat/internal/capture"
+	"github.com/virgil724/caplat/capture"
 )
 
 // Frame is a captured picture.

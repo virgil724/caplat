@@ -16,7 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/virgil724/caplat/internal/capture"
+	"github.com/virgil724/caplat/capture"
 	"github.com/virgil724/caplat/internal/win"
 )
 
@@ -185,7 +185,7 @@ func (s *Source) run(cfg Config, now func() int64, freq int64, onFrame func(capt
 		if v, err := sample.GetUINT64(&win.MFSampleExtension_DeviceTimestamp); err == nil {
 			devTS = int64(v)
 		}
-		f := capture.Frame{QPC: arrive, DeviceQPC: hnsToQPC(devTS, freq)}
+		f := capture.Frame{QPC: arrive, DeviceQPC: hnsToQPC(devTS, freq), FourCC: mode.FourCC, Width: w, Height: h}
 		if buf, err := win.SampleBuffer(sample); err == nil {
 			if data, pitch, unlock, err := win.LockBuffer(buf); err == nil {
 				if yuy2 {
@@ -200,11 +200,14 @@ func (s *Source) run(cfg Config, now func() int64, freq int64, onFrame func(capt
 						}
 					}
 					f.Y, f.Stride = luma, w
+					f.Data, f.Pitch = data[:min(len(data), stride*h)], stride
 				} else {
 					if pitch == 0 {
 						pitch = w
 					}
 					f.Y, f.Stride = data[:pitch*h], pitch
+					// 4:2:0: the chroma planes add half the luma size.
+					f.Data, f.Pitch = data[:min(len(data), pitch*h*3/2)], pitch
 				}
 				onFrame(f)
 				unlock()

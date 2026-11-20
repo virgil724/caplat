@@ -131,7 +131,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	var src audioSource
 	switch cfg.Backend {
 	case AudioWASAPI:
-		c, err := audio.StartWASAPI(in, win.QPC, freq, func(x []float64, p audio.Packet) {
+		c, err := audio.StartWASAPI(in, cfg.Period, cfg.Exclusive, win.QPC, freq, func(x []float64, p audio.Packet) {
 			if det.Load() != nil {
 				onSamples(x, p)
 			}
@@ -139,6 +139,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		if err != nil {
 			return res, err
 		}
+		res.InputPeriod = c.Period
 		src = c
 	case AudioFFmpeg:
 		fc := audio.FFmpegConfig{FFmpeg: cfg.FFmpeg, Device: in, LowLatency: cfg.Preset != PresetDefault}
