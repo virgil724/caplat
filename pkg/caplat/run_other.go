@@ -34,6 +34,9 @@ type Mode struct {
 // Displays lists the desktop's outputs.
 func Displays() ([]Display, error) { return nil, ErrUnsupported }
 
+// DevicesMF lists capture devices through Media Foundation.
+func DevicesMF() ([]string, error) { return nil, ErrUnsupported }
+
 // Devices lists capture devices.
 func Devices(context.Context, string) ([]string, error) { return nil, ErrUnsupported }
 

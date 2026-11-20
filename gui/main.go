@@ -24,7 +24,13 @@ var (
 	sizes     = []string{"1280x720", "1920x1080", "2560x1440", "3840x2160"}
 	formats   = []string{"auto", "nv12", "yuyv422", "yuv420p", "mjpeg"}
 	presets   = []string{caplat.PresetLowLatency, caplat.PresetDefault}
+	backends  = []string{backendMF, backendFFmpeg}
 	durations = []string{"10 s", "30 s", "1 min", "5 min", "30 min", "Until stopped"}
+)
+
+const (
+	backendMF     = "Media Foundation"
+	backendFFmpeg = "ffmpeg (DirectShow)"
 )
 
 var durationValue = map[string]time.Duration{
@@ -47,6 +53,7 @@ type app struct {
 	size         string
 	format       string
 	preset       string
+	backend      string
 	duration     string
 	loading      bool
 	askPrimary   bool
@@ -59,6 +66,7 @@ type app struct {
 	total   caplat.Stats
 	counts  caplat.Counts
 	hist    *caplat.Histogram
+	driver  caplat.Stats // vblank -> driver timestamp (Media Foundation)
 	elapsed time.Duration
 	status  string
 	err     string
@@ -66,7 +74,7 @@ type app struct {
 }
 
 func newApp() *app {
-	return &app{size: sizes[0], format: formats[0], preset: presets[0], duration: durations[1], loading: true}
+	return &app{size: sizes[0], format: formats[0], preset: presets[0], backend: backends[0], duration: durations[1], loading: true}
 }
 
 func displayLabel(d caplat.Display) string {
@@ -83,7 +91,10 @@ func displayLabel(d caplat.Display) string {
 // load lists displays and capture devices (ffmpeg takes a moment).
 func (a *app) load() {
 	ds, derr := caplat.Displays()
-	devs, verr := caplat.Devices(context.Background(), "")
+	devs, verr := caplat.DevicesMF()
+	if verr != nil || len(devs) == 0 {
+		devs, verr = caplat.Devices(context.Background(), "")
+	}
 	a.win.Update(func() { a.loaded(ds, devs, errors.Join(derr, verr)) })
 }
 
@@ -130,6 +141,7 @@ func (a *app) config() (caplat.Config, error) {
 	return caplat.Config{
 		Display: d.Name, Device: a.device, CaptureWidth: w, CaptureHeight: h,
 		PixelFormat: a.format, Preset: a.preset, Duration: durationValue[a.duration],
+		Backend:  map[string]string{backendMF: caplat.BackendMF, backendFFmpeg: caplat.BackendFFmpeg}[a.backend],
 		Interval: time.Minute, Force: d.Primary,
 	}, nil
 }
@@ -155,6 +167,7 @@ func (a *app) start(confirmed bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.running, a.cancel, a.err, a.status = true, cancel, "", "Starting…"
 	a.series, a.total, a.counts, a.hist, a.elapsed, a.csvPath = nil, caplat.Stats{}, caplat.Counts{}, nil, 0, f.Name()
+	a.driver = caplat.Stats{}
 
 	go func() {
 		if setup, err := caplat.Prepare(ctx, cfg); err == nil {
@@ -177,7 +190,7 @@ func (a *app) start(confirmed bool) {
 }
 
 func (a *app) apply(u caplat.Update) {
-	a.elapsed, a.total, a.counts, a.hist = u.Elapsed, u.Total, u.Counts, u.Hist
+	a.elapsed, a.total, a.counts, a.hist, a.driver = u.Elapsed, u.Total, u.Counts, u.Hist, u.Device
 	if u.Second.N > 0 {
 		a.series = append(a.series, point{t: u.Elapsed.Seconds(), p50: u.Second.P50, p90: u.Second.P90})
 	}
@@ -186,7 +199,7 @@ func (a *app) apply(u caplat.Update) {
 func (a *app) finish(r caplat.Result, err error) {
 	a.running, a.cancel = false, nil
 	if r.Total.N > 0 {
-		a.total, a.counts, a.elapsed, a.setup = r.Total, r.Counts, r.Elapsed, r.Setup
+		a.total, a.counts, a.elapsed, a.setup, a.driver = r.Total, r.Counts, r.Elapsed, r.Setup, r.Device
 		h := r.Hist
 		a.hist = &h
 	}
@@ -279,9 +292,12 @@ func (a *app) settings(c *ui.Context) {
 			field("Format", &a.format, formats).Grow(1).Basis(0)
 		})
 		ui.Row(c).Gap(10).Children(func() {
-			field("ffmpeg buffering", &a.preset, presets).Grow(1).Basis(0)
+			field("Capture API", &a.backend, backends).Grow(1).Basis(0)
 			field("Duration", &a.duration, durations).Grow(1).Basis(0)
 		})
+		if a.backend == backendFFmpeg {
+			field("ffmpeg buffering", &a.preset, presets)
+		}
 		ui.Spacer(c)
 		if a.running {
 			if ui.Button(c, "Stop").Clicked() {
@@ -297,9 +313,13 @@ func (a *app) results(c *ui.Context) {
 	t := c.Theme()
 	ui.Column(c).Grow(1).Padding(20).Gap(14).Children(func() {
 		if a.setup.Display != "" {
-			ui.Textf(c, "Output %s (%s) %s  →  capture %s, %s",
+			capture := a.setup.CaptureMode
+			if a.setup.Preset != "" {
+				capture += ", ffmpeg " + a.setup.Preset
+			}
+			ui.Textf(c, "Output %s (%s) %s  →  capture %s",
 				strings.TrimPrefix(a.setup.Display, `\\.\`), a.setup.DisplayName, a.setup.OutputMode,
-				a.setup.CaptureMode, a.setup.Preset).FontSize(12).TextColor(t.TextMuted)
+				capture).FontSize(12).TextColor(t.TextMuted)
 		}
 		a.statCards(c)
 		ui.Text(c, "Latency per second (p50, p90)").Bold()
@@ -334,6 +354,11 @@ func (a *app) statCards(c *ui.Context) {
 		{"min / max", ms(s.Min) + " / " + ms(s.Max)}, {"frames", fmt.Sprint(s.N)},
 		{"unreadable", fmt.Sprint(a.counts.DecodeFail)}, {"not captured", fmt.Sprint(a.counts.OnlyVblank)},
 		{"time", a.elapsed.Round(time.Second).String()},
+	}
+	if a.driver.N > 0 {
+		cards = append(cards,
+			struct{ label, value string }{"to driver timestamp", ms(a.driver.P50)},
+			struct{ label, value string }{"after it", ms(s.P50 - a.driver.P50)})
 	}
 	ui.Row(c).Gap(10).Wrap().Children(func() {
 		for _, k := range cards {

@@ -1,6 +1,7 @@
 package measure
 
 import (
+	"math"
 	"sync"
 
 	"github.com/virgil724/caplat/internal/barcode"
@@ -11,7 +12,11 @@ type Sample struct {
 	Frame     uint64 // presenter frame number (unwrapped)
 	VblankQPC int64  // when the frame started scanning out
 	ArriveQPC int64  // when the captured frame carrying it was read
+	DeviceQPC int64  // the driver's capture timestamp, 0 if unknown
 	LatencyMS float64
+	// DeviceMS is vblank -> driver timestamp (the card and USB), NaN if
+	// the backend has no driver timestamp.
+	DeviceMS float64
 }
 
 // Counts are frames that could not be matched.
@@ -25,6 +30,7 @@ type Counts struct {
 
 type pending struct {
 	vblank, arrive int64 // 0 = not yet
+	device         int64 // driver timestamp of the first capture
 	seenAt         int64 // qpc of the first event, for expiry
 	matched        bool
 }
@@ -33,6 +39,11 @@ type pending struct {
 // safe for concurrent use: the presenter and the capture reader feed it from
 // different goroutines.
 type Matcher struct {
+	// Settle is how many frames after warm-up are matched but not counted:
+	// the first frame statistics after the switch from warm-up can belong to
+	// a neighbouring present. Set it before use.
+	Settle uint64
+
 	freq   float64 // QPC ticks per millisecond
 	expire int64   // ticks after which an unmatched entry is counted and dropped
 	onPair func(Sample)
@@ -89,8 +100,9 @@ func (m *Matcher) Vblank(f uint64, qpc int64) {
 }
 
 // Captured records a captured frame read at qpc carrying the 24-bit code,
-// or a decode failure when ok is false.
-func (m *Matcher) Captured(code uint32, ok bool, qpc int64) {
+// or a decode failure when ok is false. deviceQPC is the driver's capture
+// timestamp in QPC ticks, or 0.
+func (m *Matcher) Captured(code uint32, ok bool, qpc, deviceQPC int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.counts.Captured++
@@ -107,7 +119,7 @@ func (m *Matcher) Captured(code uint32, ok bool, qpc int64) {
 	f := m.unwrap(code)
 	p := m.entry(f, qpc)
 	if p.arrive == 0 { // the first capture of a frame is the one that counts
-		p.arrive = qpc
+		p.arrive, p.device = qpc, deviceQPC
 		m.tryPair(f, p)
 	}
 	m.gc(qpc)
@@ -141,6 +153,9 @@ func (m *Matcher) tryPair(f uint64, p *pending) {
 		return
 	}
 	p.matched = true
+	if f <= m.Settle {
+		return // right after warm-up the frame statistics can lag a present
+	}
 	if p.arrive < p.vblank {
 		// Arrived before it was shown: two frames were confused (e.g. the
 		// presenter raced ahead while its window was hidden). Not a sample.
@@ -148,8 +163,12 @@ func (m *Matcher) tryPair(f uint64, p *pending) {
 		return
 	}
 	if m.onPair != nil {
-		m.onPair(Sample{Frame: f, VblankQPC: p.vblank, ArriveQPC: p.arrive,
-			LatencyMS: float64(p.arrive-p.vblank) / m.freq})
+		s := Sample{Frame: f, VblankQPC: p.vblank, ArriveQPC: p.arrive, DeviceQPC: p.device,
+			LatencyMS: float64(p.arrive-p.vblank) / m.freq, DeviceMS: math.NaN()}
+		if p.device != 0 {
+			s.DeviceMS = float64(p.device-p.vblank) / m.freq
+		}
+		m.onPair(s)
 	}
 }
 

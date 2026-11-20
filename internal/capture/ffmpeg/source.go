@@ -9,13 +9,12 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/virgil724/caplat/internal/capture"
 )
 
-// Frame is one captured picture: an 8-bit luma plane of Width x Height.
-type Frame struct {
-	Y   []byte
-	QPC int64 // when the whole frame had been read
-}
+// Frame is a captured picture.
+type Frame = capture.Frame
 
 // Source runs ffmpeg and delivers frames to a callback.
 type Source struct {
@@ -60,7 +59,7 @@ func (s *Source) read(r io.Reader, onFrame func(Frame)) {
 		if _, rerr = io.ReadFull(r, buf); rerr != nil {
 			break
 		}
-		onFrame(Frame{Y: luma, QPC: s.now()})
+		onFrame(Frame{Y: luma, Stride: s.cfg.Width, QPC: s.now()})
 	}
 	werr := s.cmd.Wait()
 	if errors.Is(rerr, io.EOF) && werr == nil {

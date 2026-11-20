@@ -26,18 +26,29 @@ const (
 	PresetDefault    = "default"
 )
 
+// Capture backends.
+const (
+	// BackendFFmpeg reads the card through an ffmpeg subprocess and
+	// DirectShow, as most streaming software does.
+	BackendFFmpeg = "ffmpeg"
+	// BackendMF reads it in-process with Media Foundation, and also reports
+	// the driver's capture timestamp of every frame.
+	BackendMF = "mf"
+)
+
 // ErrPrimary is returned when the chosen display is the primary one and
 // Force is not set: the measurement window would cover the desktop.
 var ErrPrimary = errors.New("the chosen display is the primary display; the full-screen barcode would cover your desktop (use --force to do it anyway)")
 
 // Config describes a measurement.
 type Config struct {
+	Backend       string // BackendMF (default) or BackendFFmpeg
 	Display       string // \\.\DISPLAYn, DISPLAYn, or "auto"
-	Device        string // DirectShow video device; "" = the only real one
+	Device        string // capture device; "" = the capture card, if it is clear which
 	CaptureWidth  int    // default 1280
 	CaptureHeight int    // default 720
 	PixelFormat   string // "auto" (default), nv12, yuyv422, mjpeg, ...
-	Preset        string // PresetLowLatency (default) or PresetDefault
+	Preset        string // ffmpeg only: PresetLowLatency (default) or PresetDefault
 	FFmpeg        string // ffmpeg binary; "" = ffmpeg on PATH
 	FFmpegIn      []string
 	FFmpegOut     []string
@@ -58,6 +69,9 @@ func (c *Config) defaults() {
 	if c.Preset == "" {
 		c.Preset = PresetLowLatency
 	}
+	if c.Backend == "" {
+		c.Backend = BackendMF
+	}
 	if c.Interval <= 0 {
 		c.Interval = time.Minute
 	}
@@ -72,8 +86,9 @@ type Setup struct {
 	DisplayName string // EDID name
 	OutputMode  string // e.g. 3840x2160@60.000
 	Device      string
+	Backend     string
 	CaptureMode string // e.g. 1280x720@60 nv12
-	Preset      string
+	Preset      string // ffmpeg only
 	FFmpegArgs  []string
 }
 
@@ -81,6 +96,7 @@ type Setup struct {
 type Interval struct {
 	Start, End time.Duration // since measuring started
 	Stats      Stats
+	Device     Stats // vblank -> driver timestamp (mf only)
 }
 
 // Update is sent about once a second while measuring.
@@ -91,6 +107,7 @@ type Update struct {
 	Counts   Counts     // unmatched frames so far
 	Interval *Interval  // set when a window closed
 	Hist     *Histogram // a copy of the total histogram, owned by the receiver
+	Device   Stats      // vblank -> driver timestamp so far (mf only)
 }
 
 // Result is the outcome of a run.
@@ -100,6 +117,7 @@ type Result struct {
 	Counts    Counts
 	Intervals []Interval
 	Hist      Histogram
+	Device    Stats // vblank -> driver timestamp (mf only; N = 0 otherwise)
 	Elapsed   time.Duration
 }
 

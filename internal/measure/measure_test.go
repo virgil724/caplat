@@ -54,10 +54,10 @@ func TestMatcherPairsInEitherOrder(t *testing.T) {
 	var got []Sample
 	m := NewMatcher(freq, func(s Sample) { got = append(got, s) })
 	m.Vblank(1, 1000)
-	m.Captured(1, true, 1000+350_000) // 35 ms later
-	m.Captured(2, true, 2000+350_000) // capture first (cannot happen, but must not break)
+	m.Captured(1, true, 1000+350_000, 0) // 35 ms later
+	m.Captured(2, true, 2000+350_000, 0) // capture first (cannot happen, but must not break)
 	m.Vblank(2, 2000)
-	m.Captured(2, true, 9_999_999) // a repeated capture of frame 2: ignored
+	m.Captured(2, true, 9_999_999, 0) // a repeated capture of frame 2: ignored
 	if len(got) != 2 || got[0].LatencyMS != 35 || got[1].Frame != 2 {
 		t.Fatalf("%+v", got)
 	}
@@ -65,11 +65,11 @@ func TestMatcherPairsInEitherOrder(t *testing.T) {
 
 func TestMatcherCountsUnmatched(t *testing.T) {
 	m := NewMatcher(freq, nil)
-	m.Captured(0, false, 0) // before any barcode: start-up black, not a failure
+	m.Captured(0, false, 0, 0) // before any barcode: start-up black, not a failure
 	m.Vblank(5, 1)
-	m.Captured(9, true, 2)
-	m.Captured(0, false, 3)
-	m.Captured(0, true, 4) // warm-up code: neither matched nor counted
+	m.Captured(9, true, 2, 0)
+	m.Captured(0, false, 3, 0)
+	m.Captured(0, true, 4, 0) // warm-up code: neither matched nor counted
 	m.Flush()
 	c := m.Counts()
 	if c.OnlyVblank != 1 || c.OnlyCapture != 1 || c.DecodeFail != 1 || c.Captured != 4 {
@@ -85,7 +85,7 @@ func TestMatcherUnwrap(t *testing.T) {
 	// Frames whose low 24 bits are 0 are never presented (code 0 is warm-up).
 	for _, f := range []uint64{span - 2, span - 1, span + 1, 3*span + 5} {
 		m.Vblank(f, int64(f))
-		m.Captured(uint32(f&uint64(barcode.Mask)), true, int64(f)+10)
+		m.Captured(uint32(f&uint64(barcode.Mask)), true, int64(f)+10, 0)
 	}
 	want := []uint64{span - 2, span - 1, span + 1, 3*span + 5}
 	if len(got) != len(want) {
@@ -115,9 +115,24 @@ func TestMatcherExpires(t *testing.T) {
 func TestMatcherRejectsNegative(t *testing.T) {
 	var got []Sample
 	m := NewMatcher(freq, func(s Sample) { got = append(got, s) })
-	m.Captured(7, true, 1000)
+	m.Captured(7, true, 1000, 0)
 	m.Vblank(7, 5000) // shown after it arrived: confusion, not a sample
 	if len(got) != 0 || m.Counts().Mismatched != 1 {
 		t.Fatalf("got %v counts %+v", got, m.Counts())
+	}
+}
+
+func TestMatcherDeviceTimestamp(t *testing.T) {
+	var got []Sample
+	m := NewMatcher(freq, func(s Sample) { got = append(got, s) })
+	m.Vblank(3, 1_000_000)
+	m.Captured(3, true, 1_000_000+350_000, 1_000_000+230_000) // driver stamped it 23 ms in
+	if len(got) != 1 || got[0].LatencyMS != 35 || got[0].DeviceMS != 23 {
+		t.Fatalf("%+v", got)
+	}
+	m.Vblank(4, 2_000_000)
+	m.Captured(4, true, 2_350_000, 0)
+	if !math.IsNaN(got[1].DeviceMS) {
+		t.Fatalf("no driver timestamp should give NaN, got %+v", got[1])
 	}
 }

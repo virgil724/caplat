@@ -7,12 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/virgil724/caplat/internal/barcode"
+	"github.com/virgil724/caplat/internal/capture"
 	"github.com/virgil724/caplat/internal/capture/ffmpeg"
+	"github.com/virgil724/caplat/internal/capture/mf"
 	"github.com/virgil724/caplat/internal/displays"
 	"github.com/virgil724/caplat/internal/measure"
 	"github.com/virgil724/caplat/internal/present"
@@ -35,10 +38,14 @@ func Displays() ([]Display, error) {
 	return displays.List()
 }
 
-// Devices lists DirectShow video capture devices.
+// Devices lists DirectShow video capture devices (through ffmpeg).
 func Devices(ctx context.Context, ffmpegBin string) ([]string, error) {
 	return ffmpeg.ListDevices(ctx, ffmpegBin)
 }
+
+// DevicesMF lists video capture devices through Media Foundation (no
+// ffmpeg needed).
+func DevicesMF() ([]string, error) { return mf.ListDevices() }
 
 // PickDevice chooses the capture card among DirectShow devices ("" if
 // that is ambiguous).
@@ -53,10 +60,23 @@ type resolved struct {
 	setup   Setup
 	display displays.Display
 	ff      ffmpeg.Config
+	mf      mf.Config
+	capW    int
+	capH    int
+}
+
+func listDevices(ctx context.Context, cfg *Config) ([]string, error) {
+	if cfg.Backend == BackendMF {
+		return mf.ListDevices()
+	}
+	return ffmpeg.ListDevices(ctx, cfg.FFmpeg)
 }
 
 func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 	cfg.defaults()
+	if cfg.Backend != BackendFFmpeg && cfg.Backend != BackendMF {
+		return resolved{}, fmt.Errorf("unknown backend %q (want %s or %s)", cfg.Backend, BackendFFmpeg, BackendMF)
+	}
 	list, err := Displays()
 	if err != nil {
 		return resolved{}, err
@@ -70,13 +90,21 @@ func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 	}
 	dev := cfg.Device
 	if dev == "" {
-		devs, err := ffmpeg.ListDevices(ctx, cfg.FFmpeg)
+		devs, err := listDevices(ctx, cfg)
 		if err != nil {
 			return resolved{}, err
 		}
 		if dev = displays.PickDevice(devs); dev == "" {
 			return resolved{}, fmt.Errorf("choose a capture device with --device; found %q", devs)
 		}
+	}
+	r := resolved{display: d, capW: cfg.CaptureWidth, capH: cfg.CaptureHeight}
+	r.setup = Setup{Display: d.Name, DisplayName: d.FriendlyName, OutputMode: d.Mode(), Device: dev, Backend: cfg.Backend}
+
+	if cfg.Backend == BackendMF {
+		r.mf = mf.Config{Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight, FPS: d.RefreshHz(), Format: cfg.PixelFormat}
+		r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s (Media Foundation)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate(), cfg.PixelFormat)
+		return r, nil
 	}
 	pf := cfg.PixelFormat
 	if strings.EqualFold(pf, "auto") {
@@ -88,21 +116,15 @@ func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 			return resolved{}, fmt.Errorf("%s: %w", dev, err)
 		}
 	}
-	ff := ffmpeg.Config{FFmpeg: cfg.FFmpeg, Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight,
+	r.ff = ffmpeg.Config{FFmpeg: cfg.FFmpeg, Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight,
 		FrameRate: d.FrameRate(), PixelFormat: pf, Preset: cfg.Preset, ExtraIn: cfg.FFmpegIn, ExtraOut: cfg.FFmpegOut}
-	args, err := ffmpeg.Args(ff)
+	args, err := ffmpeg.Args(r.ff)
 	if err != nil {
 		return resolved{}, err
 	}
-	return resolved{
-		display: d,
-		ff:      ff,
-		setup: Setup{
-			Display: d.Name, DisplayName: d.FriendlyName, OutputMode: d.Mode(),
-			Device: dev, CaptureMode: fmt.Sprintf("%dx%d@%s %s", ff.Width, ff.Height, ff.FrameRate, pf),
-			Preset: cfg.Preset, FFmpegArgs: args,
-		},
-	}, nil
+	r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s", r.ff.Width, r.ff.Height, r.ff.FrameRate, pf)
+	r.setup.Preset, r.setup.FFmpegArgs = cfg.Preset, args
+	return r, nil
 }
 
 // Prepare resolves the display, device and capture mode without measuring.
@@ -121,18 +143,19 @@ func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error)
 	}
 	res := Result{Setup: r.setup}
 	freq := win.QPCFrequency()
-	geo := barcode.Geometry{OutW: r.display.Width, OutH: r.display.Height, CapW: r.ff.Width, CapH: r.ff.Height}
+	geo := barcode.Geometry{OutW: r.display.Width, OutH: r.display.Height, CapW: r.capW, CapH: r.capH}
 
 	var (
 		mu                 sync.Mutex
 		total, sec, window measure.Histogram
+		devTotal, devWin   measure.Histogram
 		csv                *bufio.Writer
 	)
 	if cfg.CSV != nil {
 		csv = bufio.NewWriter(cfg.CSV)
-		fmt.Fprintf(csv, "# caplat display=%s (%s) output=%s device=%q capture=%s preset=%s\n",
-			r.setup.Display, r.setup.DisplayName, r.setup.OutputMode, r.setup.Device, r.setup.CaptureMode, r.setup.Preset)
-		fmt.Fprintln(csv, "frame,vblank_qpc,arrive_qpc,latency_ms")
+		fmt.Fprintf(csv, "# caplat display=%s (%s) output=%s device=%q backend=%s capture=%s preset=%s\n",
+			r.setup.Display, r.setup.DisplayName, r.setup.OutputMode, r.setup.Device, r.setup.Backend, r.setup.CaptureMode, r.setup.Preset)
+		fmt.Fprintln(csv, "frame,vblank_qpc,arrive_qpc,latency_ms,device_qpc,device_ms")
 		defer csv.Flush()
 	}
 	m := measure.NewMatcher(freq, func(s measure.Sample) {
@@ -140,20 +163,41 @@ func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error)
 		total.Add(s.LatencyMS)
 		sec.Add(s.LatencyMS)
 		window.Add(s.LatencyMS)
+		if !math.IsNaN(s.DeviceMS) {
+			devTotal.Add(s.DeviceMS)
+			devWin.Add(s.DeviceMS)
+		}
 		if csv != nil {
-			fmt.Fprintf(csv, "%d,%d,%d,%.3f\n", s.Frame, s.VblankQPC, s.ArriveQPC, s.LatencyMS)
+			dev := ""
+			if !math.IsNaN(s.DeviceMS) {
+				dev = fmt.Sprintf("%.3f", s.DeviceMS)
+			}
+			fmt.Fprintf(csv, "%d,%d,%d,%.3f,%d,%s\n", s.Frame, s.VblankQPC, s.ArriveQPC, s.LatencyMS, s.DeviceQPC, dev)
 		}
 		mu.Unlock()
 	})
+	m.Settle = 10
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	src, err := ffmpeg.Start(runCtx, r.ff, win.QPC, func(f ffmpeg.Frame) {
-		code, ok := geo.Decode(f.Y, r.ff.Width)
-		m.Captured(code, ok, f.QPC)
-	})
-	if err != nil {
-		return res, err
+	onFrame := func(f capture.Frame) {
+		code, ok := geo.Decode(f.Y, f.Stride)
+		m.Captured(code, ok, f.QPC, f.DeviceQPC)
+	}
+	var src capture.Source
+	if cfg.Backend == BackendMF {
+		s, err := mf.Start(r.mf, win.QPC, freq, onFrame)
+		if err != nil {
+			return res, err
+		}
+		res.Setup.CaptureMode = fmt.Sprintf("%dx%d@%.3f %s (Media Foundation)", s.Mode.Width, s.Mode.Height, s.Mode.FPS, s.Mode.FourCC)
+		src = s
+	} else {
+		s, err := ffmpeg.Start(runCtx, r.ff, win.QPC, onFrame)
+		if err != nil {
+			return res, err
+		}
+		src = s
 	}
 	defer src.Stop()
 
@@ -206,13 +250,14 @@ loop:
 			el := time.Since(t0)
 			mu.Lock()
 			hc := total
-			u := Update{Elapsed: el, Second: sec.Stats(), Total: total.Stats(), Hist: &hc}
+			u := Update{Elapsed: el, Second: sec.Stats(), Total: total.Stats(), Hist: &hc, Device: devTotal.Stats()}
 			sec.Reset()
 			if el >= nextWindow {
-				iv := Interval{Start: nextWindow - cfg.Interval, End: el, Stats: window.Stats()}
+				iv := Interval{Start: nextWindow - cfg.Interval, End: el, Stats: window.Stats(), Device: devWin.Stats()}
 				res.Intervals = append(res.Intervals, iv)
 				u.Interval = &iv
 				window.Reset()
+				devWin.Reset()
 				nextWindow += cfg.Interval
 			}
 			mu.Unlock()
@@ -237,9 +282,9 @@ loop:
 	mu.Lock()
 	res.Elapsed = time.Since(t0)
 	if window.N > 0 {
-		res.Intervals = append(res.Intervals, Interval{Start: nextWindow - cfg.Interval, End: res.Elapsed, Stats: window.Stats()})
+		res.Intervals = append(res.Intervals, Interval{Start: nextWindow - cfg.Interval, End: res.Elapsed, Stats: window.Stats(), Device: devWin.Stats()})
 	}
-	res.Total, res.Hist = total.Stats(), total
+	res.Total, res.Hist, res.Device = total.Stats(), total, devTotal.Stats()
 	mu.Unlock()
 	res.Counts = m.Counts()
 	return res, runErr

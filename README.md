@@ -10,10 +10,14 @@ you see both the latency and the jitter.
 
 ```
 output   \\.\DISPLAY3 AVT GC553  3840x2160@60.000
-capture  "Live Gamer Ultra-Video"  1280x720@60 nv12  preset low-latency
+capture  "Live Gamer Ultra-Video"  1280x720@60.000 NV12 (Media Foundation)
 
 latency vblank -> arrival over 22s
-  n=1197  min 35.0  p10 35.1  p50 35.2  p90 35.5  p99 35.8  max 35.9  mean 35.2 ms
+  n=1197  min 17.9  p10 17.9  p50 18.1  p90 18.1  p99 18.2  max 18.5  mean 18.0 ms
+
+split at the driver's capture timestamp (Media Foundation)
+  vblank -> driver timestamp:  n=1197  min 6.2  p10 6.2  p50 6.2  p90 6.2  p99 6.2  max 7.0  mean 6.2 ms
+  driver timestamp -> caplat:  p50 11.9 ms (rest of the frame over USB, driver, Media Foundation)
 ```
 
 It comes as a command-line tool and a desktop app (built with
@@ -33,15 +37,22 @@ It comes as a command-line tool and a desktop app (built with
    (`IDXGISwapChain::GetFrameStatistics`, a QueryPerformanceCounter time of
    the vblank). The PC's own compositor and presentation queue are not
    counted.
-4. It reads the card back through ffmpeg's DirectShow input, decodes the
-   barcode in every captured frame and notes when the frame arrived, on the
-   same QueryPerformanceCounter clock.
+4. It reads the card back, decodes the barcode in every captured frame and
+   notes when the frame arrived, on the same QueryPerformanceCounter clock.
+   Two capture backends:
+   - `mf`: Media Foundation in-process (`IMFSourceReader`, low-latency
+     mode). It also gets the driver's capture timestamp of every frame
+     (`MFSampleExtension_DeviceTimestamp`, on the same clock), which splits
+     the latency in two. No ffmpeg needed.
+   - `ffmpeg`: an ffmpeg subprocess reading DirectShow, as most streaming
+     software does.
 5. latency = arrival − vblank, for every frame. Statistics live in a fixed
    0.1 ms histogram, so a run can last hours.
 
 What the number includes: the HDMI transmission of the frame (a frame has to
 be received whole before a card can deliver it, 16.7 ms at 60 Hz), the card's
-processing and scaling, USB transfer, the driver, DirectShow and ffmpeg.
+processing and scaling, USB transfer, the driver, and the capture API
+(Media Foundation, or DirectShow and ffmpeg).
 That is the latency a streaming or remote-play app built on the card
 actually pays.
 
@@ -49,10 +60,16 @@ actually pays.
 
 AVerMedia **GC553** (Live Gamer Ultra), 4K60 in, 1280x720@60 NV12 capture:
 
-| ffmpeg options | p50 | p10–p90 |
+| Capture path | p50 | p10–p90 |
 |---|---|---|
-| `low-latency` preset (`-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0`, `-fps_mode passthrough`) | **35.2 ms** | 0.4 ms |
-| `default` (plain `ffmpeg -f dshow`) | 59.6 ms (or 76 ms, decided at start-up) | 15 ms |
+| **Media Foundation**, in-process | **18.1 ms** | 0.2 ms |
+| ffmpeg + DirectShow, `low-latency` preset (`-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0`, `-fps_mode passthrough`) | 35.2 ms | 0.4 ms |
+| ffmpeg + DirectShow, `default` (plain `ffmpeg -f dshow`) | 59.6 ms (or 76 ms, decided at start-up) | 15 ms |
+
+The card itself is fast: receiving a 60 Hz frame over HDMI takes about
+16 ms, and Media Foundation has it 18 ms after vblank. The driver stamps a
+frame 6.2 ms after vblank, as it starts to arrive. **The ffmpeg/DirectShow
+path costs one whole extra frame** even with every low-latency option.
 
 With default options ffmpeg probes the input while the device opens and that
 read-ahead never drains, because frames are then read exactly as fast as
@@ -67,10 +84,12 @@ restarted. It happens on its own (after about 15 s in one run, 95 s in
 another, not at all in a 90 s run) and also right after a deliberate CPU
 stall; once it has happened, further stalls cause long spikes but no second
 step.
-Shrinking ffmpeg's real-time buffer (`-rtbufsize 2M`) does not prevent it,
-so the extra frame is queued below ffmpeg, in DirectShow or the driver. Any
-software reading the card this way can carry that frame; a long `--interval`
-run shows it as a step.
+Shrinking ffmpeg's real-time buffer (`-rtbufsize 2M`) does not prevent it.
+Media Foundation never does it: under the same CPU stalls it spikes and
+comes straight back to 18.1 ms, and the driver timestamps stay at 6.2 ms
+throughout. So the frame is queued in the DirectShow/ffmpeg path, not in the
+driver. Any software reading the card through DirectShow can carry it; a
+long `--interval` run shows it as a step.
 
 caplat keeps the display awake during a run and stops with an error if the
 barcode stops being shown (display asleep, window covered), instead of
@@ -78,8 +97,9 @@ measuring garbage.
 
 ## Install
 
-You need [ffmpeg](https://ffmpeg.org/download.html) on your `PATH` (for now;
-a native Media Foundation reader is planned).
+Nothing else is needed for the default Media Foundation backend.
+[ffmpeg](https://ffmpeg.org/download.html) on your `PATH` is only needed for
+`--backend ffmpeg`.
 
 - **Desktop app**: download `caplat-gui.exe` from the
   [releases](https://github.com/virgil724/caplat/releases).
@@ -91,7 +111,8 @@ a native Media Foundation reader is planned).
 caplat list
 ```
 lists the displays (marking the primary one and those whose EDID name looks
-like a capture card) and the DirectShow devices with their modes.
+like a capture card) and the DirectShow devices with their modes (through
+ffmpeg, if it is installed).
 
 ```
 caplat run --device "Live Gamer Ultra-Video" --duration 30s
@@ -99,15 +120,16 @@ caplat run --device "Live Gamer Ultra-Video" --duration 30s
 
 | Flag | Default | |
 |---|---|---|
+| `--backend` | `mf` | `mf` (Media Foundation, in-process, with driver timestamps) or `ffmpeg` (DirectShow through ffmpeg) |
 | `--display` | `auto` | `\\.\DISPLAY3`, `DISPLAY3`, or `auto` (the one display whose EDID name looks like a capture card) |
-| `--device` | auto | DirectShow video device; auto picks the capture card |
+| `--device` | auto | capture device; auto picks the capture card |
 | `--size` | `1280x720` | capture size |
-| `--pixel-format` | `auto` | `nv12`, `yuyv422`, `mjpeg`, ...; auto prefers uncompressed formats |
-| `--preset` | `low-latency` | ffmpeg buffering: `low-latency` or `default` |
-| `--ffmpeg-in`, `--ffmpeg-out` | | extra ffmpeg options before `-f dshow` / after `-i` |
+| `--pixel-format` | `auto` | mf: `NV12`, `YUY2`, ...; ffmpeg: `nv12`, `yuyv422`, `mjpeg`, ...; auto prefers uncompressed formats |
+| `--preset` | `low-latency` | ffmpeg only: `low-latency` or `default` |
+| `--ffmpeg-in`, `--ffmpeg-out` | | ffmpeg only: extra options before `-f dshow` / after `-i` |
 | `--duration` | `30s` | `0` runs until you stop it |
 | `--interval` | `1m` | print statistics every interval (to see drift on long runs) |
-| `--csv` | | write every matched frame (frame, vblank, arrival, latency) |
+| `--csv` | | write every matched frame (frame, vblank, arrival, latency, driver timestamp) |
 | `--force` | | allow measuring on the primary display |
 
 Press **Esc** or click the barcode window to stop early; the results so far
@@ -144,7 +166,8 @@ caplat is pure Go: Direct3D 11, DXGI and the Win32 calls go through
 
 ## Roadmap
 
-- Native Media Foundation capture, to separate the card from ffmpeg/DirectShow.
+- Find why DirectShow keeps the extra frame (and whether it can be drained).
+- Rarely, a Media Foundation frame carries the previous frame's driver timestamp (one sample in thousands, 16.7 ms off).
 - Linux: DRM vblank events and V4L2.
 
 ## License

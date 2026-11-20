@@ -144,10 +144,11 @@ func firstLine(s string) string {
 func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var cfg caplat.Config
+	fs.StringVar(&cfg.Backend, "backend", caplat.BackendMF, "capture backend: mf (Media Foundation; also reports the driver's timestamp) or ffmpeg (DirectShow through ffmpeg)")
 	fs.StringVar(&cfg.Display, "display", "auto", `output feeding the card: \\.\DISPLAY3, DISPLAY3 or auto`)
-	fs.StringVar(&cfg.Device, "device", "", "DirectShow video device (default: the only one that is not virtual)")
+	fs.StringVar(&cfg.Device, "device", "", "capture device (default: the one that looks like a capture card)")
 	size := fs.String("size", "1280x720", "capture size WxH")
-	fs.StringVar(&cfg.PixelFormat, "pixel-format", "auto", "capture format: auto, nv12, yuyv422, mjpeg, ...")
+	fs.StringVar(&cfg.PixelFormat, "pixel-format", "auto", "capture format: auto, nv12, yuyv422, mjpeg, ... (mf: auto, NV12, YUY2, ...)")
 	fs.StringVar(&cfg.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering: low-latency or default")
 	fs.StringVar(&cfg.FFmpeg, "ffmpeg", "", "ffmpeg binary (default: ffmpeg on PATH)")
 	ffIn := fs.String("ffmpeg-in", "", "extra ffmpeg options before -f dshow")
@@ -188,7 +189,11 @@ func run(args []string) error {
 		defer close(done)
 		for u := range updates {
 			if u.Interval != nil {
-				fmt.Printf("[%s-%s] %s\n", round(u.Interval.Start), round(u.Interval.End), caplat.FormatStats(u.Interval.Stats))
+				line := fmt.Sprintf("[%s-%s] %s", round(u.Interval.Start), round(u.Interval.End), caplat.FormatStats(u.Interval.Stats))
+				if d := u.Interval.Device; d.N > 0 {
+					line += fmt.Sprintf("  | to driver timestamp p50 %.1f, after it %.1f", d.P50, u.Interval.Stats.P50-d.P50)
+				}
+				fmt.Println(line)
 			}
 		}
 	}()
@@ -224,6 +229,10 @@ func round(d time.Duration) time.Duration { return d.Round(time.Second) }
 
 func printSetup(s caplat.Setup) {
 	fmt.Printf("output   %s %s  %s\n", s.Display, s.DisplayName, s.OutputMode)
+	if s.Backend == caplat.BackendMF {
+		fmt.Printf("capture  %q  %s\n", s.Device, s.CaptureMode)
+		return
+	}
 	fmt.Printf("capture  %q  %s  preset %s\n", s.Device, s.CaptureMode, s.Preset)
 	fmt.Printf("ffmpeg   %s\n", strings.Join(s.FFmpegArgs, " "))
 }
@@ -234,4 +243,9 @@ func printResult(r caplat.Result) {
 	fmt.Printf("  captured %d frames, barcode unreadable %d, presented but not captured %d, captured without vblank %d, mismatched %d\n",
 		c.Captured, c.DecodeFail, c.OnlyVblank, c.OnlyCapture, c.Mismatched)
 	fmt.Printf("  output %s, capture %s\n", r.Setup.OutputMode, r.Setup.CaptureMode)
+	if d := r.Device; d.N > 0 {
+		fmt.Printf("\nsplit at the driver's capture timestamp (Media Foundation)\n")
+		fmt.Printf("  vblank -> driver timestamp:  %s\n", caplat.FormatStats(d))
+		fmt.Printf("  driver timestamp -> caplat:  p50 %.1f ms (rest of the frame over USB, driver, Media Foundation)\n", r.Total.P50-d.P50)
+	}
 }
