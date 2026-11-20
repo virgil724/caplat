@@ -24,12 +24,13 @@ var (
 	sizes     = []string{"1280x720", "1920x1080", "2560x1440", "3840x2160"}
 	formats   = []string{"auto", "nv12", "yuyv422", "yuv420p", "mjpeg"}
 	presets   = []string{caplat.PresetLowLatency, caplat.PresetDefault}
-	backends  = []string{backendMF, backendFFmpeg}
+	backends  = []string{backendMF, backendDShow, backendFFmpeg}
 	durations = []string{"10 s", "30 s", "1 min", "5 min", "30 min", "Until stopped"}
 )
 
 const (
 	backendMF     = "Media Foundation"
+	backendDShow  = "DirectShow"
 	backendFFmpeg = "ffmpeg (DirectShow)"
 )
 
@@ -163,7 +164,7 @@ func (a *app) config() (caplat.Config, error) {
 	return caplat.Config{
 		Display: disp, Device: a.device, CaptureWidth: w, CaptureHeight: h,
 		PixelFormat: a.format, Preset: a.preset, Duration: durationValue[a.duration],
-		Backend:  map[string]string{backendMF: caplat.BackendMF, backendFFmpeg: caplat.BackendFFmpeg}[a.backend],
+		Backend:  map[string]string{backendMF: caplat.BackendMF, backendDShow: caplat.BackendDShow, backendFFmpeg: caplat.BackendFFmpeg}[a.backend],
 		Interval: time.Minute, Force: d.Primary,
 	}, nil
 }

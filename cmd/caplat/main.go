@@ -144,7 +144,7 @@ func firstLine(s string) string {
 func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var cfg caplat.Config
-	fs.StringVar(&cfg.Backend, "backend", caplat.BackendMF, "capture backend: mf (Media Foundation; also reports the driver's timestamp) or ffmpeg (DirectShow through ffmpeg)")
+	fs.StringVar(&cfg.Backend, "backend", caplat.BackendMF, "capture backend: mf (Media Foundation; also reports the driver's timestamp), dshow (DirectShow in-process) or ffmpeg (DirectShow through ffmpeg)")
 	fs.StringVar(&cfg.Display, "display", "auto", `output feeding the card: \\.\DISPLAY3, DISPLAY3 or auto`)
 	fs.StringVar(&cfg.Device, "device", "", "capture device (default: the one that looks like a capture card)")
 	size := fs.String("size", "1280x720", "capture size WxH")
@@ -229,7 +229,7 @@ func round(d time.Duration) time.Duration { return d.Round(time.Second) }
 
 func printSetup(s caplat.Setup) {
 	fmt.Printf("output   %s %s  %s\n", s.Display, s.DisplayName, s.OutputMode)
-	if s.Backend == caplat.BackendMF {
+	if s.Backend != caplat.BackendFFmpeg {
 		fmt.Printf("capture  %q  %s\n", s.Device, s.CaptureMode)
 		return
 	}

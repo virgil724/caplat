@@ -34,6 +34,9 @@ const (
 	// BackendMF reads it in-process with Media Foundation, and also reports
 	// the driver's capture timestamp of every frame.
 	BackendMF = "mf"
+	// BackendDShow reads it in-process with DirectShow (capture filter ->
+	// SampleGrabber -> NullRenderer, no graph clock), without ffmpeg.
+	BackendDShow = "dshow"
 )
 
 // ErrPrimary is returned when the chosen display is the primary one and
@@ -42,7 +45,7 @@ var ErrPrimary = errors.New("the chosen display is the primary display; the full
 
 // Config describes a measurement.
 type Config struct {
-	Backend       string // BackendMF (default) or BackendFFmpeg
+	Backend       string // BackendMF (default), BackendDShow or BackendFFmpeg
 	Display       string // \\.\DISPLAYn, DISPLAYn, or "auto"
 	Device        string // capture device; "" = the capture card, if it is clear which
 	CaptureWidth  int    // default 1280

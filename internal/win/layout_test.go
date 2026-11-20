@@ -26,6 +26,14 @@ func TestLayouts(t *testing.T) {
 		{"sourceDeviceName", unsafe.Sizeof(sourceDeviceName{}), 84},
 		{"targetDeviceName", unsafe.Sizeof(targetDeviceName{}), 420},
 		{"Msg", unsafe.Sizeof(Msg{}), 48},
+		{"AMMediaType", unsafe.Sizeof(AMMediaType{}), 88},
+		{"AMMediaType.FormatType", unsafe.Offsetof(AMMediaType{}.FormatType), 44},
+		{"AMMediaType.Unk", unsafe.Offsetof(AMMediaType{}.Unk), 64},
+		{"AMMediaType.PbFormat", unsafe.Offsetof(AMMediaType{}.PbFormat), 80},
+		{"VideoStreamConfigCaps", unsafe.Sizeof(VideoStreamConfigCaps{}), 128},
+		{"VideoStreamConfigCaps.MinFrameInterval", unsafe.Offsetof(VideoStreamConfigCaps{}.MinFrameInterval), 104},
+		{"variant", unsafe.Sizeof(variant{}), 24},
+		{"variant.BSTR", unsafe.Offsetof(variant{}.BSTR), 8},
 	}
 	for _, c := range cases {
 		if c.got != c.want {

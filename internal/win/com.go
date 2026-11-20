@@ -31,8 +31,12 @@ func (o Object) method(i int) uintptr {
 }
 
 // call invokes vtable entry i with o as the first argument. Callers pass
-// pointers as uintptr(unsafe.Pointer(&x)) directly in the argument list so
-// the compiler keeps the referents alive and unmoved for the call.
+// pointers as uintptr(unsafe.Pointer(&x)) directly in the argument list;
+// go:uintptrescapes moves each referent to the heap and keeps it alive for
+// the call. Without it, a goroutine stack that grows during the call moves
+// &x, and COM writes through the stale address.
+//
+//go:uintptrescapes
 func (o Object) call(i int, args ...uintptr) uintptr {
 	r, _, _ := syscall.SyscallN(o.method(i), append([]uintptr{uintptr(o)}, args...)...)
 	return r

@@ -14,6 +14,7 @@ import (
 
 	"github.com/virgil724/caplat/internal/barcode"
 	"github.com/virgil724/caplat/internal/capture"
+	"github.com/virgil724/caplat/internal/capture/dshow"
 	"github.com/virgil724/caplat/internal/capture/ffmpeg"
 	"github.com/virgil724/caplat/internal/capture/mf"
 	"github.com/virgil724/caplat/internal/displays"
@@ -51,6 +52,17 @@ func DevicesMF() ([]string, error) { return mf.ListDevices() }
 // that is ambiguous).
 func PickDevice(devices []string) string { return displays.PickDevice(devices) }
 
+// DevicesDShow lists DirectShow video capture devices in-process (no
+// ffmpeg needed).
+func DevicesDShow() ([]string, error) { return dshow.ListDevices() }
+
+func apiName(backend string) string {
+	if backend == BackendDShow {
+		return "DirectShow"
+	}
+	return "Media Foundation"
+}
+
 // Modes lists a device's capture modes.
 func Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error) {
 	return ffmpeg.ListModes(ctx, ffmpegBin, device)
@@ -60,22 +72,25 @@ type resolved struct {
 	setup   Setup
 	display displays.Display
 	ff      ffmpeg.Config
-	mf      mf.Config
+	mf      mf.Config // also used for dshow
 	capW    int
 	capH    int
 }
 
 func listDevices(ctx context.Context, cfg *Config) ([]string, error) {
-	if cfg.Backend == BackendMF {
+	switch cfg.Backend {
+	case BackendMF:
 		return mf.ListDevices()
+	case BackendDShow:
+		return dshow.ListDevices()
 	}
 	return ffmpeg.ListDevices(ctx, cfg.FFmpeg)
 }
 
 func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 	cfg.defaults()
-	if cfg.Backend != BackendFFmpeg && cfg.Backend != BackendMF {
-		return resolved{}, fmt.Errorf("unknown backend %q (want %s or %s)", cfg.Backend, BackendFFmpeg, BackendMF)
+	if cfg.Backend != BackendFFmpeg && cfg.Backend != BackendMF && cfg.Backend != BackendDShow {
+		return resolved{}, fmt.Errorf("unknown backend %q (want %s, %s or %s)", cfg.Backend, BackendMF, BackendDShow, BackendFFmpeg)
 	}
 	list, err := Displays()
 	if err != nil {
@@ -101,9 +116,9 @@ func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 	r := resolved{display: d, capW: cfg.CaptureWidth, capH: cfg.CaptureHeight}
 	r.setup = Setup{Display: d.Name, DisplayName: d.FriendlyName, OutputMode: d.Mode(), Device: dev, Backend: cfg.Backend}
 
-	if cfg.Backend == BackendMF {
+	if cfg.Backend == BackendMF || cfg.Backend == BackendDShow {
 		r.mf = mf.Config{Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight, FPS: d.RefreshHz(), Format: cfg.PixelFormat}
-		r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s (Media Foundation)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate(), cfg.PixelFormat)
+		r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s (%s)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate(), cfg.PixelFormat, apiName(cfg.Backend))
 		return r, nil
 	}
 	pf := cfg.PixelFormat
@@ -185,14 +200,23 @@ func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error)
 		m.Captured(code, ok, f.QPC, f.DeviceQPC)
 	}
 	var src capture.Source
-	if cfg.Backend == BackendMF {
+	switch cfg.Backend {
+	case BackendDShow:
+		c := r.mf
+		s, err := dshow.Start(dshow.Config{Device: c.Device, Width: c.Width, Height: c.Height, FPS: c.FPS, Format: c.Format}, win.QPC, onFrame)
+		if err != nil {
+			return res, err
+		}
+		res.Setup.CaptureMode = fmt.Sprintf("%dx%d@%.3f %s (DirectShow)", s.Mode.Width, s.Mode.Height, s.Mode.FPS, s.Mode.FourCC)
+		src = s
+	case BackendMF:
 		s, err := mf.Start(r.mf, win.QPC, freq, onFrame)
 		if err != nil {
 			return res, err
 		}
 		res.Setup.CaptureMode = fmt.Sprintf("%dx%d@%.3f %s (Media Foundation)", s.Mode.Width, s.Mode.Height, s.Mode.FPS, s.Mode.FourCC)
 		src = s
-	} else {
+	default:
 		s, err := ffmpeg.Start(runCtx, r.ff, win.QPC, onFrame)
 		if err != nil {
 			return res, err
