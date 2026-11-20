@@ -89,6 +89,7 @@ type DisplayPath struct {
 	GDIName      string   // \\.\DISPLAYn
 	FriendlyName string   // from EDID, e.g. "AVT GC553"
 	Refresh      Rational // target refresh rate, e.g. 60000/1001
+	DevicePath   string   // the monitor's device path; unlike GDIName it survives renumbering
 }
 
 // ActiveDisplayPaths lists the active display paths.
@@ -122,6 +123,7 @@ func ActiveDisplayPaths() ([]DisplayPath, error) {
 			GDIName:      windows.UTF16ToString(src.ViewGdiDevName[:]),
 			FriendlyName: windows.UTF16ToString(tgt.MonitorFriendlyDeviceName[:]),
 			Refresh:      p.Target.RefreshRate,
+			DevicePath:   windows.UTF16ToString(tgt.MonitorDevicePath[:]),
 		})
 	}
 	return out, nil

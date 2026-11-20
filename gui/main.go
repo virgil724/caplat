@@ -42,7 +42,8 @@ var durationValue = map[string]time.Duration{
 type point struct{ t, p50, p90 float64 }
 
 type app struct {
-	win *mygo.Window
+	win          *mygo.Window
+	listDisplays func() ([]caplat.Display, error)
 
 	// Choices.
 	displays     []caplat.Display
@@ -74,7 +75,7 @@ type app struct {
 }
 
 func newApp() *app {
-	return &app{size: sizes[0], format: formats[0], preset: presets[0], backend: backends[0], duration: durations[1], loading: true}
+	return &app{listDisplays: caplat.Displays, size: sizes[0], format: formats[0], preset: presets[0], backend: backends[0], duration: durations[1], loading: true}
 }
 
 func displayLabel(d caplat.Display) string {
@@ -119,6 +120,23 @@ func (a *app) loaded(ds []caplat.Display, devs []string, err error) {
 	}
 }
 
+// refreshDisplays lists the displays again, keeping the chosen one by its
+// stable ID: Windows renumbers \\.\DISPLAYn when displays sleep or reconnect.
+func (a *app) refreshDisplays() {
+	ds, err := a.listDisplays()
+	if err != nil || len(ds) == 0 {
+		return
+	}
+	old, had := a.chosenDisplay()
+	a.displays, a.displayLabel, a.display = ds, nil, ""
+	for _, d := range ds {
+		a.displayLabel = append(a.displayLabel, displayLabel(d))
+		if had && (d.ID != "" && d.ID == old.ID || old.ID == "" && d.Name == old.Name) {
+			a.display = displayLabel(d)
+		}
+	}
+}
+
 func (a *app) chosenDisplay() (caplat.Display, bool) {
 	for i, l := range a.displayLabel {
 		if l == a.display {
@@ -138,8 +156,12 @@ func (a *app) config() (caplat.Config, error) {
 	}
 	var w, h int
 	fmt.Sscanf(a.size, "%dx%d", &w, &h)
+	disp := d.ID
+	if disp == "" {
+		disp = d.Name
+	}
 	return caplat.Config{
-		Display: d.Name, Device: a.device, CaptureWidth: w, CaptureHeight: h,
+		Display: disp, Device: a.device, CaptureWidth: w, CaptureHeight: h,
 		PixelFormat: a.format, Preset: a.preset, Duration: durationValue[a.duration],
 		Backend:  map[string]string{backendMF: caplat.BackendMF, backendFFmpeg: caplat.BackendFFmpeg}[a.backend],
 		Interval: time.Minute, Force: d.Primary,
@@ -149,6 +171,7 @@ func (a *app) config() (caplat.Config, error) {
 // start begins a run; confirmed is true once the user accepted measuring on
 // the primary display.
 func (a *app) start(confirmed bool) {
+	a.refreshDisplays()
 	cfg, err := a.config()
 	if err != nil {
 		a.err = err.Error()

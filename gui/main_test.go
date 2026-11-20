@@ -16,10 +16,39 @@ var testDisplays = []caplat.Display{
 
 var testDevices = []string{"OBS Virtual Camera", "Live Gamer Ultra-Video"}
 
+// testApp is an app that lists ds as the displays, never the real ones.
+func testApp(ds []caplat.Display) *app {
+	a := newApp()
+	a.listDisplays = func() ([]caplat.Display, error) { return ds, nil }
+	a.loaded(ds, testDevices, nil)
+	return a
+}
+
+// Windows renumbers displays; the chosen one is followed by its ID.
+func TestDisplayFollowedAfterRenumbering(t *testing.T) {
+	before := []caplat.Display{
+		{Name: `\\.\DISPLAY2`, ID: "mon-mag", FriendlyName: "MAG274QRF-QD", Primary: true},
+		{Name: `\\.\DISPLAY3`, ID: "mon-gc553", FriendlyName: "AVT GC553", LikelyCard: true},
+	}
+	after := []caplat.Display{
+		{Name: `\\.\DISPLAY3`, ID: "mon-mag", FriendlyName: "MAG274QRF-QD", Primary: true},
+		{Name: `\\.\DISPLAY1`, ID: "mon-gc553", FriendlyName: "AVT GC553", LikelyCard: true},
+	}
+	a := testApp(before)
+	a.listDisplays = func() ([]caplat.Display, error) { return after, nil }
+	a.refreshDisplays()
+	d, ok := a.chosenDisplay()
+	if !ok || d.Name != `\\.\DISPLAY1` || d.Primary {
+		t.Fatalf("chose %+v", d)
+	}
+	if cfg, err := a.config(); err != nil || cfg.Display != "mon-gc553" || cfg.Force {
+		t.Errorf("config %+v err %v", cfg, err)
+	}
+}
+
 // The capture card's output and device are chosen by default.
 func TestDefaultsPickTheCard(t *testing.T) {
-	a := newApp()
-	a.loaded(testDisplays, testDevices, nil)
+	a := testApp(testDisplays)
 	tt := ui.NewTester(a.view, 1100, 760)
 	if !tt.HasText("Live Gamer Ultra-Video") {
 		t.Errorf("device not chosen; texts %q", tt.Texts())
@@ -36,8 +65,7 @@ func TestDefaultsPickTheCard(t *testing.T) {
 
 // Choosing the primary display asks before covering it.
 func TestPrimaryAsksFirst(t *testing.T) {
-	a := newApp()
-	a.loaded(testDisplays, testDevices, nil)
+	a := testApp(testDisplays)
 	a.display = displayLabel(testDisplays[0])
 	a.start(false)
 	if !a.askPrimary || a.running {

@@ -15,7 +15,8 @@ import (
 
 // Display is one output attached to the desktop.
 type Display struct {
-	Name         string // \\.\DISPLAYn
+	Name         string // \\.\DISPLAYn; Windows may renumber these at any time
+	ID           string // the monitor's device path, stable across renumbering ("" if unknown)
 	FriendlyName string // EDID name, e.g. "AVT GC553"
 	Rect         win.RECT
 	Width        int // physical pixels
@@ -136,6 +137,7 @@ func List() ([]Display, error) {
 			}
 			if p, ok := byName[d.Name]; ok {
 				d.FriendlyName = p.FriendlyName
+				d.ID = p.DevicePath
 				d.RefreshNum, d.RefreshDen = p.Refresh.Numerator, p.Refresh.Denominator
 			}
 			d.LikelyCard = likelyCard(d.FriendlyName)
@@ -146,8 +148,9 @@ func List() ([]Display, error) {
 	return out, nil
 }
 
-// Find returns the display named name, or with name "auto" the single one
-// whose EDID name looks like a capture card.
+// Find returns the display whose ID or name (\\.\DISPLAYn or DISPLAYn) is
+// name, or with name "auto" the single one whose EDID name looks like a
+// capture card.
 func Find(list []Display, name string) (Display, error) {
 	if strings.EqualFold(name, "auto") || name == "" {
 		var cards []Display
@@ -165,9 +168,18 @@ func Find(list []Display, name string) (Display, error) {
 		return Display{}, fmt.Errorf("several displays look like capture cards; pass --display (see `caplat list`)")
 	}
 	for _, d := range list {
+		if d.ID != "" && strings.EqualFold(d.ID, name) {
+			return d, nil
+		}
+	}
+	for _, d := range list {
 		if strings.EqualFold(d.Name, name) || strings.EqualFold(strings.TrimPrefix(d.Name, `\\.\`), name) {
 			return d, nil
 		}
 	}
-	return Display{}, fmt.Errorf("display %q not found (see `caplat list`)", name)
+	var have []string
+	for _, d := range list {
+		have = append(have, strings.TrimSpace(strings.TrimPrefix(d.Name, `\\.\`)+" "+d.FriendlyName))
+	}
+	return Display{}, fmt.Errorf("display %s not found; the displays now are: %s", name, strings.Join(have, ", "))
 }
