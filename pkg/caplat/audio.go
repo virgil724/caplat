@@ -28,6 +28,20 @@ type AudioConfig struct {
 	CSV      io.Writer     // optional: one row per chirp
 	// OnInterval, if set, gets each window's statistics as it ends.
 	OnInterval func(AudioInterval)
+	// OnUpdate, if set, gets the statistics so far about once a second.
+	OnUpdate func(AudioUpdate)
+}
+
+// AudioUpdate is the state of a running audio measurement.
+type AudioUpdate struct {
+	Elapsed  time.Duration
+	Second   Stats      // delivered latency of the chirps paired in the last second
+	Total    Stats      // delivered latency so far
+	Device   Stats      // to the driver's timestamp so far (wasapi only)
+	Hist     *Histogram // of the delivered latency so far (a copy)
+	Emitted  int
+	Detected int
+	Matched  int
 }
 
 // AudioInterval is the statistics of one window.

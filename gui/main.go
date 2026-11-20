@@ -26,6 +26,16 @@ var (
 	presets   = []string{caplat.PresetLowLatency, caplat.PresetDefault}
 	backends  = []string{backendMF, backendDShow, backendFFmpeg}
 	durations = []string{"10 s", "30 s", "1 min", "5 min", "30 min", "Until stopped"}
+	modes     = []string{modeVideo, modeAudio, modeSync}
+	audioAPIs = []string{audioWASAPI, audioFFmpeg}
+)
+
+const (
+	modeVideo   = "Video"
+	modeAudio   = "Audio"
+	modeSync    = "A/V sync"
+	audioWASAPI = "WASAPI"
+	audioFFmpeg = "ffmpeg (DirectShow)"
 )
 
 const (
@@ -59,6 +69,12 @@ type app struct {
 	duration     string
 	loading      bool
 	askPrimary   bool
+	mode         string
+	audioOuts    []string
+	audioIns     []string
+	audioOut     string
+	audioIn      string
+	audioAPI     string
 
 	// The run.
 	running bool
@@ -70,13 +86,21 @@ type app struct {
 	hist    *caplat.Histogram
 	driver  caplat.Stats // vblank -> driver timestamp (Media Foundation)
 	elapsed time.Duration
-	status  string
-	err     string
-	csvPath string // temporary CSV of the last run, for Export
+	// Audio results (audio and A/V sync modes).
+	aSeries  []point
+	aTotal   caplat.Stats
+	aDriver  caplat.Stats
+	aHist    *caplat.Histogram
+	aEmitted int
+	aMatched int
+	status   string
+	err      string
+	csvPath  string // temporary CSV of the last run, for Export
 }
 
 func newApp() *app {
-	return &app{listDisplays: caplat.Displays, size: sizes[0], format: formats[0], preset: presets[0], backend: backends[0], duration: durations[1], loading: true}
+	return &app{listDisplays: caplat.Displays, size: sizes[0], format: formats[0], preset: presets[0], backend: backends[0], duration: durations[1], loading: true,
+		mode: modeVideo, audioAPI: audioAPIs[0]}
 }
 
 func displayLabel(d caplat.Display) string {
@@ -97,7 +121,55 @@ func (a *app) load() {
 	if verr != nil || len(devs) == 0 {
 		devs, verr = caplat.Devices(context.Background(), "")
 	}
-	a.win.Update(func() { a.loaded(ds, devs, errors.Join(derr, verr)) })
+	outs, oerr := caplat.AudioOutputs()
+	ins, ierr := caplat.AudioInputs()
+	a.win.Update(func() {
+		a.loaded(ds, devs, errors.Join(derr, verr))
+		if oerr == nil && ierr == nil {
+			a.loadedAudio(outs, ins)
+		}
+	})
+}
+
+func (a *app) loadedAudio(outs, ins []string) {
+	a.audioOuts, a.audioIns = outs, ins
+	if a.audioOut == "" {
+		a.audioOut = caplat.PickDevice(outs)
+	}
+	if a.audioIn == "" {
+		a.audioIn = caplat.PickDevice(ins)
+	}
+}
+
+func (a *app) audioConfig() (caplat.AudioConfig, error) {
+	if a.audioOut == "" || a.audioIn == "" {
+		return caplat.AudioConfig{}, errors.New("choose the audio output feeding the card and the card's audio input")
+	}
+	b := caplat.AudioWASAPI
+	if a.audioAPI == audioFFmpeg {
+		b = caplat.AudioFFmpeg
+	}
+	return caplat.AudioConfig{Backend: b, Output: a.audioOut, Input: a.audioIn, Preset: a.preset,
+		Duration: durationValue[a.duration]}, nil
+}
+
+// onAudio delivers the audio updates to the UI thread.
+func (a *app) onAudio(u caplat.AudioUpdate) {
+	a.win.Update(func() {
+		a.aTotal, a.aDriver, a.aHist, a.aEmitted, a.aMatched = u.Total, u.Device, u.Hist, u.Emitted, u.Matched
+		if u.Second.N > 0 {
+			a.aSeries = append(a.aSeries, point{t: u.Elapsed.Seconds(), p50: u.Second.P50, p90: u.Second.P90})
+		}
+		if a.mode == modeAudio {
+			a.elapsed = u.Elapsed
+		}
+	})
+}
+
+func (a *app) finishAudio(r caplat.AudioResult) {
+	if r.Matched > 0 {
+		a.aTotal, a.aDriver, a.aEmitted, a.aMatched = r.Delivered, r.Device, r.Emitted, r.Matched
+	}
 }
 
 func (a *app) loaded(ds []caplat.Display, devs []string, err error) {
@@ -172,6 +244,10 @@ func (a *app) config() (caplat.Config, error) {
 // start begins a run; confirmed is true once the user accepted measuring on
 // the primary display.
 func (a *app) start(confirmed bool) {
+	if a.mode == modeAudio {
+		a.startAudio()
+		return
+	}
 	a.refreshDisplays()
 	cfg, err := a.config()
 	if err != nil {
@@ -187,11 +263,19 @@ func (a *app) start(confirmed bool) {
 		a.err = err.Error()
 		return
 	}
+	var acfg caplat.AudioConfig
+	if a.mode == modeSync {
+		if acfg, err = a.audioConfig(); err != nil {
+			f.Close()
+			a.err = err.Error()
+			return
+		}
+		acfg.OnUpdate = a.onAudio
+	}
 	cfg.CSV = f
+	sync := a.mode == modeSync
 	ctx, cancel := context.WithCancel(context.Background())
-	a.running, a.cancel, a.err, a.status = true, cancel, "", "Starting…"
-	a.series, a.total, a.counts, a.hist, a.elapsed, a.csvPath = nil, caplat.Stats{}, caplat.Counts{}, nil, 0, f.Name()
-	a.driver = caplat.Stats{}
+	a.reset(cancel, f.Name())
 
 	go func() {
 		if setup, err := caplat.Prepare(ctx, cfg); err == nil {
@@ -205,11 +289,64 @@ func (a *app) start(confirmed bool) {
 				a.win.Update(func() { a.apply(u) })
 			}
 		}()
-		res, err := caplat.Run(ctx, cfg, updates)
+		var (
+			res  caplat.Result
+			ares caplat.AudioResult
+			err  error
+		)
+		if sync {
+			var av caplat.AVResult
+			av, err = caplat.RunAV(ctx, cfg, acfg, updates)
+			res, ares = av.Video, av.Audio
+		} else {
+			res, err = caplat.Run(ctx, cfg, updates)
+		}
 		close(updates)
 		<-done
 		f.Close()
-		a.win.Update(func() { a.finish(res, err) })
+		a.win.Update(func() {
+			a.finishAudio(ares)
+			a.finish(res, err)
+		})
+	}()
+}
+
+// reset clears the last results and marks a run as started.
+func (a *app) reset(cancel context.CancelFunc, csvPath string) {
+	a.running, a.cancel, a.err, a.status = true, cancel, "", "Starting…"
+	a.series, a.total, a.counts, a.hist, a.elapsed, a.csvPath = nil, caplat.Stats{}, caplat.Counts{}, nil, 0, csvPath
+	a.driver, a.setup = caplat.Stats{}, caplat.Setup{}
+	a.aSeries, a.aTotal, a.aDriver, a.aHist, a.aEmitted, a.aMatched = nil, caplat.Stats{}, caplat.Stats{}, nil, 0, 0
+}
+
+func (a *app) startAudio() {
+	cfg, err := a.audioConfig()
+	if err != nil {
+		a.err = err.Error()
+		return
+	}
+	f, err := os.CreateTemp("", "caplat-audio-*.csv")
+	if err != nil {
+		a.err = err.Error()
+		return
+	}
+	cfg.CSV, cfg.OnUpdate = f, a.onAudio
+	ctx, cancel := context.WithCancel(context.Background())
+	a.reset(cancel, f.Name())
+	a.status = "Measuring audio: a 10 ms chirp every 500 ms"
+	go func() {
+		res, err := caplat.RunAudio(ctx, cfg)
+		f.Close()
+		a.win.Update(func() {
+			a.running, a.cancel = false, nil
+			a.finishAudio(res)
+			a.elapsed = res.Elapsed
+			if err != nil {
+				a.err, a.status = err.Error(), ""
+			} else {
+				a.status = fmt.Sprintf("Done: %d of %d chirps over %s", res.Matched, res.Emitted, res.Elapsed.Round(time.Second))
+			}
+		})
 	}()
 }
 
@@ -309,17 +446,32 @@ func (a *app) settings(c *ui.Context) {
 				ui.Select(c, value, options).Label(label).Disabled(busy)
 			})
 		}
-		field("Output feeding the card", &a.display, a.displayLabel)
-		field("Capture device", &a.device, a.devices)
 		ui.Row(c).Gap(10).Children(func() {
-			field("Capture size", &a.size, sizes).Grow(1).Basis(0)
-			field("Format", &a.format, formats).Grow(1).Basis(0)
-		})
-		ui.Row(c).Gap(10).Children(func() {
-			field("Capture API", &a.backend, backends).Grow(1).Basis(0)
+			field("Measure", &a.mode, modes).Grow(1).Basis(0)
 			field("Duration", &a.duration, durations).Grow(1).Basis(0)
 		})
-		if a.backend == backendFFmpeg {
+		video, sound := a.mode != modeAudio, a.mode != modeVideo
+		if video {
+			field("Output feeding the card", &a.display, a.displayLabel)
+			field("Capture device", &a.device, a.devices)
+			ui.Row(c).Gap(10).Children(func() {
+				field("Capture size", &a.size, sizes).Grow(1).Basis(0)
+				field("Format", &a.format, formats).Grow(1).Basis(0)
+			})
+		}
+		if sound {
+			field("Audio output feeding the card", &a.audioOut, a.audioOuts)
+			field("Audio input (the card)", &a.audioIn, a.audioIns)
+		}
+		ui.Row(c).Gap(10).Children(func() {
+			if video {
+				field("Video capture API", &a.backend, backends).Grow(1).Basis(0)
+			}
+			if sound {
+				field("Audio capture API", &a.audioAPI, audioAPIs).Grow(1).Basis(0)
+			}
+		})
+		if video && a.backend == backendFFmpeg || sound && a.audioAPI == audioFFmpeg {
 			field("ffmpeg buffering", &a.preset, presets)
 		}
 		ui.Spacer(c)
@@ -345,11 +497,31 @@ func (a *app) results(c *ui.Context) {
 				strings.TrimPrefix(a.setup.Display, `\\.\`), a.setup.DisplayName, a.setup.OutputMode,
 				capture).FontSize(12).TextColor(t.TextMuted)
 		}
+		if a.mode != modeVideo && a.audioOut != "" {
+			ui.Textf(c, "Audio %s  →  %s (%s)", a.audioOut, a.audioIn, a.audioAPI).FontSize(12).TextColor(t.TextMuted)
+		}
 		a.statCards(c)
-		ui.Text(c, "Latency per second (p50, p90)").Bold()
-		a.lineChart(c)
-		ui.Text(c, "Distribution").Bold()
-		a.histogram(c)
+		switch a.mode {
+		case modeAudio:
+			ui.Text(c, "Audio latency per second (p50, p90)").Bold()
+			a.lineChart(c, a.aSeries, nil)
+			ui.Text(c, "Distribution").Bold()
+			a.histogram(c, a.aHist)
+		case modeSync:
+			ui.Row(c).Gap(14).Children(func() {
+				ui.Text(c, "Latency per second (p50)").Bold()
+				ui.Text(c, "— video").TextColor(t.Accent)
+				ui.Text(c, "— audio").TextColor(t.Warning)
+			})
+			a.lineChart(c, a.series, a.aSeries)
+			ui.Text(c, "Video distribution").Bold()
+			a.histogram(c, a.hist)
+		default:
+			ui.Text(c, "Latency per second (p50, p90)").Bold()
+			a.lineChart(c, a.series, nil)
+			ui.Text(c, "Distribution").Bold()
+			a.histogram(c, a.hist)
+		}
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 			if a.err != "" {
 				ui.Text(c, a.err).TextColor(t.Danger).Grow(1)
@@ -373,16 +545,35 @@ func ms(v float64) string {
 func (a *app) statCards(c *ui.Context) {
 	t := c.Theme()
 	s := a.total
-	cards := []struct{ label, value string }{
-		{"p50 ms", ms(s.P50)}, {"p10–p90", ms(s.P10) + "–" + ms(s.P90)}, {"p99", ms(s.P99)},
-		{"min / max", ms(s.Min) + " / " + ms(s.Max)}, {"frames", fmt.Sprint(s.N)},
-		{"unreadable", fmt.Sprint(a.counts.DecodeFail)}, {"not captured", fmt.Sprint(a.counts.OnlyVblank)},
-		{"time", a.elapsed.Round(time.Second).String()},
+	type card = struct{ label, value string }
+	var cards []card
+	if a.mode == modeAudio {
+		s = a.aTotal
+		cards = []card{
+			{"p50 ms", ms(s.P50)}, {"p10–p90", ms(s.P10) + "–" + ms(s.P90)}, {"p99", ms(s.P99)},
+			{"min / max", ms(s.Min) + " / " + ms(s.Max)}, {"chirps found", fmt.Sprintf("%d / %d", a.aMatched, a.aEmitted)},
+			{"time", a.elapsed.Round(time.Second).String()},
+		}
+		if a.aDriver.N > 0 {
+			cards = append(cards, card{"to driver timestamp", ms(a.aDriver.P50)}, card{"after it", ms(s.P50 - a.aDriver.P50)})
+		}
+	} else {
+		cards = []card{
+			{"p50 ms", ms(s.P50)}, {"p10–p90", ms(s.P10) + "–" + ms(s.P90)}, {"p99", ms(s.P99)},
+			{"min / max", ms(s.Min) + " / " + ms(s.Max)}, {"frames", fmt.Sprint(s.N)},
+			{"unreadable", fmt.Sprint(a.counts.DecodeFail)}, {"not captured", fmt.Sprint(a.counts.OnlyVblank)},
+			{"time", a.elapsed.Round(time.Second).String()},
+		}
+		if a.driver.N > 0 {
+			cards = append(cards, card{"to driver timestamp", ms(a.driver.P50)}, card{"after it", ms(s.P50 - a.driver.P50)})
+		}
 	}
-	if a.driver.N > 0 {
-		cards = append(cards,
-			struct{ label, value string }{"to driver timestamp", ms(a.driver.P50)},
-			struct{ label, value string }{"after it", ms(s.P50 - a.driver.P50)})
+	if a.mode == modeSync {
+		cards = append(cards, card{"audio p50", ms(a.aTotal.P50)},
+			card{"A/V skew", skew(a.aTotal, s)})
+		if a.driver.N > 0 && a.aDriver.N > 0 {
+			cards = append(cards, card{"skew at drivers", skew(a.aDriver, a.driver)})
+		}
 	}
 	ui.Row(c).Gap(10).Wrap().Children(func() {
 		for _, k := range cards {
@@ -394,9 +585,22 @@ func (a *app) statCards(c *ui.Context) {
 	})
 }
 
-func (a *app) lineChart(c *ui.Context) {
+// skew formats audio minus video p50: "+2.4 late" means the sound comes
+// 2.4 ms after the picture.
+func skew(audio, video caplat.Stats) string {
+	if audio.N == 0 || video.N == 0 {
+		return "–"
+	}
+	d := audio.P50 - video.P50
+	if d >= 0 {
+		return fmt.Sprintf("+%.1f late", d)
+	}
+	return fmt.Sprintf("%.1f early", d)
+}
+
+// lineChart draws pts (p50 and a fainter p90), and other's p50 when given.
+func (a *app) lineChart(c *ui.Context, pts, other []point) {
 	t := c.Theme()
-	pts := a.series
 	if len(pts) == 0 {
 		ui.Box(c).Height(180).Radius(8).Border(1, t.Border).Center().Children(func() {
 			ui.Text(c, "No data yet").TextColor(t.TextMuted)
@@ -404,10 +608,15 @@ func (a *app) lineChart(c *ui.Context) {
 		return
 	}
 	lo, hi := math.Inf(1), math.Inf(-1)
+	end := pts[len(pts)-1].t
 	for _, p := range pts {
 		lo, hi = math.Min(lo, p.p50), math.Max(hi, p.p90)
 	}
-	x := chart.NewLinear(0, math.Max(pts[len(pts)-1].t, 10)).Nice(5)
+	for _, p := range other {
+		lo, hi = math.Min(lo, p.p50), math.Max(hi, p.p50)
+		end = math.Max(end, p.t)
+	}
+	x := chart.NewLinear(0, math.Max(end, 10)).Nice(5)
 	y := chart.NewLinear(math.Max(0, lo-2), hi+2).Nice(4)
 	yt := y.Ticks(4)
 	xs := make([]float32, len(pts))
@@ -416,20 +625,28 @@ func (a *app) lineChart(c *ui.Context) {
 	for i, p := range pts {
 		xs[i], p50[i], p90[i] = x.At(p.t), y.At(p.p50), y.At(p.p90)
 	}
+	oxs := make([]float32, len(other))
+	o50 := make([]float32, len(other))
+	for i, p := range other {
+		oxs[i], o50[i] = x.At(p.t), y.At(p.p50)
+	}
 	chart.Plot(c, chart.Axes{Left: yt, Bottom: x.Ticks(5)}, func(area ui.Element) {
 		area.Draw(func(p *ui.Painter, r ui.Rect) {
 			for _, tk := range yt {
 				p.Line(r.X, chart.Y(r, tk.At), r.X+r.W, chart.Y(r, tk.At), 1, t.Border)
 			}
-			p.StrokePath(chart.Line(r, xs, p90, chart.CurveLinear), 1.5, t.Accent.Alpha(0.4))
+			if len(other) == 0 {
+				p.StrokePath(chart.Line(r, xs, p90, chart.CurveLinear), 1.5, t.Accent.Alpha(0.4))
+			} else if len(other) > 1 {
+				p.StrokePath(chart.Line(r, oxs, o50, chart.CurveLinear), 2, t.Warning)
+			}
 			p.StrokePath(chart.Line(r, xs, p50, chart.CurveLinear), 2, t.Accent)
 		})
 	}).Label("Latency over time").Height(180).Gap(6)
 }
 
-func (a *app) histogram(c *ui.Context) {
+func (a *app) histogram(c *ui.Context, h *caplat.Histogram) {
 	t := c.Theme()
-	h := a.hist
 	if h == nil || h.N == 0 {
 		ui.Box(c).Height(150).Radius(8).Border(1, t.Border)
 		return

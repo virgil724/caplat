@@ -25,6 +25,8 @@ const (
 	chirpPeriod = 0.5 // seconds; latency must stay below 0.45 s to pair
 	chirpFirst  = 1.0
 	chirpLevel  = 0.5
+	// chirpJitter spreads chirps over two 10 ms capture packet periods.
+	chirpJitter = 0.02
 )
 
 // AudioOutputs and AudioInputs list the active audio endpoints.
@@ -90,6 +92,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		det            atomic.Pointer[audio.Detector]
 		rate           int64
 		delTot, delWin measure.Histogram
+		delSec         measure.Histogram
 		devTot, devWin measure.Histogram
 		csv            *bufio.Writer
 	)
@@ -159,7 +162,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	det.Store(d)
 
 	pl, err := audio.StartPlayer(audio.PlayerConfig{
-		Endpoint: out, Period: chirpPeriod, First: chirpFirst, Level: chirpLevel,
+		Endpoint: out, Period: chirpPeriod, First: chirpFirst, Level: chirpLevel, Jitter: chirpJitter,
 		Chirp: func(rate int) []float64 { return audio.Chirp(rate, rate*chirpMS/1000, chirpF0, chirpF1) },
 	}, freq, func(e audio.Emitted) {
 		mu.Lock()
@@ -204,6 +207,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 			del := toMS(dt.arr - e.QPC)
 			delTot.Add(del)
 			delWin.Add(del)
+			delSec.Add(del)
 			devStr := ""
 			if dt.dev != 0 {
 				dv := toMS(dt.dev - e.QPC)
@@ -236,7 +240,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	t0 := time.Now()
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
-	nextWin := cfg.Interval
+	nextWin, nextUpdate := cfg.Interval, time.Second
 	var runErr error
 loop:
 	for {
@@ -263,6 +267,16 @@ loop:
 					cfg.OnInterval(iv)
 				}
 				nextWin += cfg.Interval
+			}
+			if cfg.OnUpdate != nil && el >= nextUpdate {
+				nextUpdate += time.Second
+				mu.Lock()
+				hc := delTot
+				u := AudioUpdate{Elapsed: el, Second: delSec.Stats(), Total: delTot.Stats(), Device: devTot.Stats(), Hist: &hc,
+					Emitted: res.Emitted, Detected: res.Detected, Matched: res.Matched}
+				delSec.Reset()
+				mu.Unlock()
+				cfg.OnUpdate(u)
 			}
 			if cfg.Duration > 0 && el >= cfg.Duration {
 				break loop

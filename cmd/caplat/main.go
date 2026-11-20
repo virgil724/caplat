@@ -38,6 +38,8 @@ func main() {
 		err = run(os.Args[2:])
 	case "audio":
 		err = runAudio(os.Args[2:])
+	case "sync":
+		err = runSync(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -59,6 +61,7 @@ usage:
   caplat list [--ffmpeg PATH]
   caplat run [flags]          (caplat run -h for flags)
   caplat audio [flags]        audio latency (caplat audio -h for flags)
+  caplat sync [flags]         video and audio together: A/V skew (caplat sync -h)
 
 Connect an HDMI output of this PC to the card's input and extend the desktop
 onto it. Press Esc or click the barcode window to stop early.
@@ -308,4 +311,59 @@ func runAudio(args []string) error {
 		fmt.Printf("  chirps played %d, found %d, paired %d\n", res.Emitted, res.Detected, res.Matched)
 	}
 	return err
+}
+
+func runSync(args []string) error {
+	fs := flag.NewFlagSet("sync", flag.ExitOnError)
+	var v caplat.Config
+	var a caplat.AudioConfig
+	fs.StringVar(&v.Backend, "backend", caplat.BackendMF, "video capture backend: mf, dshow or ffmpeg")
+	fs.StringVar(&a.Backend, "audio-backend", caplat.AudioWASAPI, "audio capture backend: wasapi or ffmpeg")
+	fs.StringVar(&v.Display, "display", "auto", "output feeding the card")
+	fs.StringVar(&v.Device, "device", "", "video capture device")
+	size := fs.String("size", "1280x720", "capture size WxH")
+	fs.StringVar(&a.Output, "output", "", "audio output feeding the card")
+	fs.StringVar(&a.Input, "input", "", "the card's audio input")
+	fs.StringVar(&v.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering (both): low-latency or default")
+	fs.DurationVar(&v.Duration, "duration", 30*time.Second, "how long to measure (0 = until Esc / Ctrl+C)")
+	fs.BoolVar(&v.Force, "force", false, "allow measuring on the primary display")
+	fs.Parse(args)
+	w, h, err := parseSize(*size)
+	if err != nil {
+		return err
+	}
+	v.CaptureWidth, v.CaptureHeight = w, h
+	a.Preset = v.Preset
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	setup, err := caplat.Prepare(ctx, v)
+	if err != nil {
+		return err
+	}
+	printSetup(setup)
+	fmt.Println("measuring video and audio together... (Esc or click the barcode window to stop)")
+	res, err := caplat.RunAV(ctx, v, a, nil)
+	aborted := errors.Is(err, caplat.ErrAborted)
+	if err != nil && !aborted {
+		return err
+	}
+	fmt.Printf("audio    %q -> %q via %s\n", res.Audio.Output, res.Audio.Input, res.Audio.Backend)
+	fmt.Printf("\nvideo  vblank -> caplat:        %s\n", caplat.FormatStats(res.Video.Total))
+	fmt.Printf("audio  played -> caplat:        %s\n", caplat.FormatStats(res.Audio.Delivered))
+	if sk := res.Skew(); !math.IsNaN(sk) {
+		fmt.Printf("\nA/V skew at caplat: audio %+.1f ms vs video (%s)\n", sk, lateWord(sk))
+	}
+	if d := res.DriverSkew(); !math.IsNaN(d) {
+		fmt.Printf("  at the drivers' timestamps: video %.1f ms, audio %.1f ms -> audio %+.1f ms (%s)\n",
+			res.Video.Device.P50, res.Audio.Device.P50, d, lateWord(d))
+	}
+	return nil
+}
+
+func lateWord(skew float64) string {
+	if skew >= 0 {
+		return "sound later than picture"
+	}
+	return "sound earlier than picture"
 }

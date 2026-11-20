@@ -85,3 +85,35 @@ func TestLoadErrorShown(t *testing.T) {
 		t.Errorf("texts %q", tt.Texts())
 	}
 }
+
+// Audio mode shows the audio endpoints, picks the card's, and needs no
+// display.
+func TestAudioMode(t *testing.T) {
+	a := testApp(testDisplays)
+	a.loadedAudio([]string{"1 - M27Q (AMD HDMI)", "4 - AVT GC553 (AMD HDMI)"},
+		[]string{"CABLE Output (VB-Audio Virtual Cable)", "HDMI (Live Gamer Ultra-Audio)"})
+	a.mode = modeAudio
+	tt := ui.NewTester(a.view, 1100, 760)
+	if !tt.HasText("Audio input (the card)") || tt.HasText("Capture size") {
+		t.Errorf("texts %q", tt.Texts())
+	}
+	cfg, err := a.audioConfig()
+	if err != nil || cfg.Output != "4 - AVT GC553 (AMD HDMI)" || cfg.Input != "HDMI (Live Gamer Ultra-Audio)" || cfg.Backend != caplat.AudioWASAPI {
+		t.Errorf("config %+v err %v", cfg, err)
+	}
+}
+
+// A/V sync shows the skew of audio against video.
+func TestSyncSkewCard(t *testing.T) {
+	a := testApp(testDisplays)
+	a.mode = modeSync
+	a.total = caplat.Stats{N: 100, P50: 18.1}
+	a.aTotal = caplat.Stats{N: 10, P50: 20.5}
+	tt := ui.NewTester(a.view, 1100, 760)
+	if !tt.HasText("+2.4 late") {
+		t.Errorf("texts %q", tt.Texts())
+	}
+	if got := skew(caplat.Stats{N: 1, P50: 10}, caplat.Stats{N: 1, P50: 18}); got != "-8.0 early" {
+		t.Errorf("skew %q", got)
+	}
+}

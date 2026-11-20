@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -134,6 +135,10 @@ type PlayerConfig struct {
 	Period   float64                  // seconds between chirps
 	First    float64                  // seconds before the first chirp
 	Level    float64                  // peak amplitude, 0..1
+	// Jitter adds a random 0..Jitter seconds to each period, so chirps
+	// fall at every phase of the capture's packet period instead of
+	// always the same one.
+	Jitter float64
 }
 
 // Player plays chirps in shared mode and reports when each was played,
@@ -184,36 +189,47 @@ func (p *Player) run(cfg PlayerConfig, freq int64, onEmit func(Emitted), ready c
 	chirp := cfg.Chirp(f.Rate)
 	period := int64(cfg.Period * float64(f.Rate))
 	first := int64(cfg.First * float64(f.Rate))
-	var written int64 // frames written so far
-	pending := []int64{}
+	jitter := int64(cfg.Jitter * float64(f.Rate))
+	rng := rand.New(rand.NewPCG(uint64(freq), 0x6361706c6174))
+	var written int64   // frames written so far
+	var pending []int64 // chirps written, not yet played
+	var sched []int64   // chirps whose samples are still being written
 	nextChirp, nextN := first, 0
 
-	sample := func(i int64) float64 {
-		if i < first {
-			return 0
-		}
-		off := (i - first) % period
-		if off < int64(len(chirp)) {
-			return cfg.Level * chirp[off]
-		}
-		return 0
-	}
 	fill := func(n int) error {
 		buf, err := win.RenderBuffer(rc, n, f.BlockAlign)
 		if err != nil {
 			return err
 		}
+		end := written + int64(n)
+		for nextChirp < end {
+			sched = append(sched, nextChirp)
+			pending = append(pending, nextChirp)
+			nextChirp += period
+			if jitter > 0 {
+				nextChirp += rng.Int64N(jitter)
+			}
+		}
 		for i := 0; i < n; i++ {
-			v := sample(written + int64(i))
+			idx, v := written+int64(i), 0.0
+			for _, s := range sched {
+				if idx >= s && idx < s+int64(len(chirp)) {
+					v = cfg.Level * chirp[idx-s]
+				}
+			}
 			for c := 0; c < f.Channels; c++ {
 				putSample(buf[i*f.BlockAlign+c*f.Bits/8:], f, v)
 			}
 		}
-		for nextChirp < written+int64(n) {
-			pending = append(pending, nextChirp)
-			nextChirp += period
+		k := 0
+		for _, s := range sched {
+			if s+int64(len(chirp)) > end {
+				sched[k] = s
+				k++
+			}
 		}
-		written += int64(n)
+		sched = sched[:k]
+		written = end
 		return win.RenderRelease(rc, n)
 	}
 	if err := fill(ac.Frames); err != nil {

@@ -14,3 +14,8 @@ func AudioInputs() ([]string, error) { return nil, ErrUnsupported }
 func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	return AudioResult{}, ErrUnsupported
 }
+
+// RunAV measures video and audio together.
+func RunAV(ctx context.Context, v Config, a AudioConfig, updates chan<- Update) (AVResult, error) {
+	return AVResult{}, ErrUnsupported
+}
