@@ -231,7 +231,7 @@ func printSetup(s caplat.Setup) {
 func printResult(r caplat.Result) {
 	c := r.Counts
 	fmt.Printf("\nlatency vblank -> arrival over %s\n  %s\n", round(r.Elapsed), caplat.FormatStats(r.Total))
-	fmt.Printf("  captured %d frames, barcode unreadable %d, presented but not captured %d, captured without vblank %d\n",
-		c.Captured, c.DecodeFail, c.OnlyVblank, c.OnlyCapture)
+	fmt.Printf("  captured %d frames, barcode unreadable %d, presented but not captured %d, captured without vblank %d, mismatched %d\n",
+		c.Captured, c.DecodeFail, c.OnlyVblank, c.OnlyCapture, c.Mismatched)
 	fmt.Printf("  output %s, capture %s\n", r.Setup.OutputMode, r.Setup.CaptureMode)
 }

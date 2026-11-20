@@ -26,6 +26,7 @@ var (
 	procGetModuleHandleW              = modKernel32.NewProc("GetModuleHandleW")
 	procQueryPerformanceCounter       = modKernel32.NewProc("QueryPerformanceCounter")
 	procQueryPerformanceFrequency     = modKernel32.NewProc("QueryPerformanceFrequency")
+	procSetThreadExecutionState       = modKernel32.NewProc("SetThreadExecutionState")
 )
 
 // Window messages and styles used by the presenter.
@@ -42,6 +43,19 @@ const (
 	WS_EX_TOPMOST = 0x00000008
 	PM_REMOVE     = 0x0001
 )
+
+// KeepAwake keeps the displays on and the system awake (no screen saver, no
+// display power-off, no sleep) until the returned function is called. A
+// display that switches off mid-run stops showing the barcode.
+func KeepAwake() (restore func()) {
+	const (
+		esSystemRequired  = 0x00000001
+		esDisplayRequired = 0x00000002
+		esContinuous      = 0x80000000
+	)
+	procSetThreadExecutionState.Call(esContinuous | esSystemRequired | esDisplayRequired)
+	return func() { procSetThreadExecutionState.Call(esContinuous) }
+}
 
 // QPC returns QueryPerformanceCounter.
 func QPC() int64 {

@@ -20,6 +20,7 @@ type Counts struct {
 	OnlyCapture uint64 // captured, no vblank time for it
 	DecodeFail  uint64 // captured frames whose barcode did not decode (after the first one did)
 	Captured    uint64 // captured frames read
+	Mismatched  uint64 // paired, but arrived before its vblank (not counted as samples)
 }
 
 type pending struct {
@@ -140,6 +141,12 @@ func (m *Matcher) tryPair(f uint64, p *pending) {
 		return
 	}
 	p.matched = true
+	if p.arrive < p.vblank {
+		// Arrived before it was shown: two frames were confused (e.g. the
+		// presenter raced ahead while its window was hidden). Not a sample.
+		m.counts.Mismatched++
+		return
+	}
 	if m.onPair != nil {
 		m.onPair(Sample{Frame: f, VblankQPC: p.vblank, ArriveQPC: p.arrive,
 			LatencyMS: float64(p.arrive-p.vblank) / m.freq})

@@ -59,6 +59,21 @@ read-ahead never drains, because frames are then read exactly as fast as
 they arrive: one or two frames of extra latency, chosen at random each time
 the capture starts, plus about a frame of jitter.
 
+### Long runs: one frame that never comes back
+
+Over minutes the low-latency capture of the GC553 sometimes steps from
+35 ms to 52 ms, exactly one frame more, and stays there until the capture is
+restarted. It happened at random (after 15 s in one run, 95 s in another, not
+at all in a third), and every time a short CPU stall triggered it on purpose.
+Shrinking ffmpeg's real-time buffer (`-rtbufsize 2M`) does not prevent it,
+so the extra frame is queued below ffmpeg, in DirectShow or the driver. Any
+software reading the card this way can carry that frame; a long `--interval`
+run shows it as a step.
+
+caplat keeps the display awake during a run and stops with an error if the
+barcode stops being shown (display asleep, window covered), instead of
+measuring garbage.
+
 ## Install
 
 You need [ffmpeg](https://ffmpeg.org/download.html) on your `PATH` (for now;

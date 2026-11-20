@@ -60,6 +60,8 @@ func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 func Run(ctx context.Context, cfg Config) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	// SetThreadExecutionState is per thread: call it on this locked thread.
+	defer win.KeepAwake()()
 	procOnce.Do(func() { wndProcCB = win.NewWndProc(wndProc) })
 	aborted.Store(false)
 
@@ -150,6 +152,9 @@ func Run(ctx context.Context, cfg Config) error {
 		tex.Release()
 
 		if err := sc.Present(1, 0); err != nil {
+			if errors.Is(err, win.ErrOccluded) {
+				return err
+			}
 			return fmt.Errorf("present: %w (was the display unplugged?)", err)
 		}
 		if pc, err := sc.GetLastPresentCount(); err == nil {

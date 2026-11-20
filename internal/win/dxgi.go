@@ -3,6 +3,7 @@
 package win
 
 import (
+	"errors"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -129,8 +130,20 @@ type SwapChain struct{ Object }
 
 // Present presents the back buffer.
 func (s SwapChain) Present(syncInterval, flags uint32) error {
-	return hr(s.call(vtSwapChainPresent, uintptr(syncInterval), uintptr(flags)))
+	r := s.call(vtSwapChainPresent, uintptr(syncInterval), uintptr(flags))
+	if HRESULT(r) == DXGI_STATUS_OCCLUDED {
+		return ErrOccluded
+	}
+	return hr(r)
 }
+
+// DXGI_STATUS_OCCLUDED is a success code Present returns when nothing was
+// shown: the window is covered or minimized, or the display is asleep. It
+// then no longer waits for vsync.
+const DXGI_STATUS_OCCLUDED HRESULT = 0x087A0001
+
+// ErrOccluded reports a Present that showed nothing.
+var ErrOccluded = errors.New("the barcode window is not being shown (display asleep, window covered, or display switched off)")
 
 // GetBuffer returns back buffer i as an ID3D11Texture2D.
 func (s SwapChain) GetBuffer(i uint32) (Object, error) {

@@ -111,3 +111,13 @@ func TestMatcherExpires(t *testing.T) {
 		t.Fatal("expired frames not counted")
 	}
 }
+
+func TestMatcherRejectsNegative(t *testing.T) {
+	var got []Sample
+	m := NewMatcher(freq, func(s Sample) { got = append(got, s) })
+	m.Captured(7, true, 1000)
+	m.Vblank(7, 5000) // shown after it arrived: confusion, not a sample
+	if len(got) != 0 || m.Counts().Mismatched != 1 {
+		t.Fatalf("got %v counts %+v", got, m.Counts())
+	}
+}
