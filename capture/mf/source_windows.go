@@ -36,9 +36,14 @@ type Mode struct {
 	FPS           float64
 }
 
-// luma formats this backend can read: planar formats whose Y plane comes
-// first, and YUY2 (Y in every other byte).
-var lumaFormats = map[string]bool{"NV12": true, "I420": true, "YV12": true, "IYUV": true, "YUY2": true}
+// lumaFormats lists the native formats this backend can decode to 8-bit luma:
+// 4:2:0 planar (8-bit and P010 10-bit), 4:2:2 packed (YUY2, UYVY), and
+// uncompressed RGB (RGB32, RGB24).
+var lumaFormats = map[string]bool{
+	"NV12": true, "I420": true, "YV12": true, "IYUV": true,
+	"YUY2": true, "UYVY": true,
+	"P010": true, "RGB32": true, "RGB24": true,
+}
 
 // withMF runs f on a locked thread with COM and Media Foundation started.
 func withMF(f func() error) error {
@@ -151,6 +156,19 @@ func (s *Source) run(cfg Config, now func() int64, freq int64, onFrame func(capt
 		return err
 	}
 	s.Mode = mode
+	// Negative MF_MT_DEFAULT_STRIDE indicates bottom-up RGB when LockBuffer
+	// falls back to plain IMFMediaBuffer::Lock (which does not report sign).
+	var defaultBottomUp bool
+	var defaultPitch int
+	if v, err := t.GetUINT32(&win.MF_MT_DEFAULT_STRIDE); err == nil {
+		st := int32(v)
+		if st < 0 {
+			defaultBottomUp = true
+			defaultPitch = int(-st)
+		} else if st > 0 {
+			defaultPitch = int(st)
+		}
+	}
 	rd.SetStreamSelection(win.MF_SOURCE_READER_ALL_STREAMS, false)
 	rd.SetStreamSelection(stream, true)
 	err = rd.SetCurrentMediaType(stream, t)
@@ -161,9 +179,8 @@ func (s *Source) run(cfg Config, now func() int64, freq int64, onFrame func(capt
 	ready <- nil
 
 	w, h := mode.Width, mode.Height
-	yuy2 := mode.FourCC == "YUY2"
 	var luma []byte
-	if yuy2 {
+	if capture.NeedsLumaBuffer(mode.FourCC) {
 		luma = make([]byte, w*h)
 	}
 	for !s.stop.Load() {
@@ -187,29 +204,16 @@ func (s *Source) run(cfg Config, now func() int64, freq int64, onFrame func(capt
 		}
 		f := capture.Frame{QPC: arrive, DeviceQPC: hnsToQPC(devTS, freq), FourCC: mode.FourCC, Width: w, Height: h}
 		if buf, err := win.SampleBuffer(sample); err == nil {
-			if data, pitch, unlock, err := win.LockBuffer(buf); err == nil {
-				if yuy2 {
-					stride := pitch
-					if stride == 0 {
-						stride = w * 2
-					}
-					for y := 0; y < h; y++ {
-						row := data[y*stride : y*stride+w*2]
-						for x := 0; x < w; x++ {
-							luma[y*w+x] = row[2*x]
-						}
-					}
-					f.Y, f.Stride = luma, w
-					f.Data, f.Pitch = data[:min(len(data), stride*h)], stride
-				} else {
-					if pitch == 0 {
-						pitch = w
-					}
-					f.Y, f.Stride = data[:pitch*h], pitch
-					// 4:2:0: the chroma planes add half the luma size.
-					f.Data, f.Pitch = data[:min(len(data), pitch*h*3/2)], pitch
+			if data, pitch, bottomUp, unlock, err := win.LockBuffer(buf, h); err == nil {
+				if pitch == 0 {
+					pitch = defaultPitch
+					bottomUp = defaultBottomUp
 				}
-				onFrame(f)
+				if y, stride, raw, rawPitch, ok := capture.ExtractLuma(mode.FourCC, data, pitch, w, h, bottomUp, luma); ok {
+					f.Y, f.Stride = y, stride
+					f.Data, f.Pitch = raw, rawPitch
+					onFrame(f)
+				}
 				unlock()
 			}
 			buf.Release()
@@ -244,8 +248,14 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 			return 0
 		case "I420", "IYUV", "YV12":
 			return 1
-		case "YUY2":
+		case "YUY2", "UYVY":
 			return 2
+		case "P010":
+			return 3
+		case "RGB32":
+			return 4
+		case "RGB24":
+			return 5
 		}
 		return -1
 	}
@@ -261,7 +271,7 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 		sub, _ := t.GetGUID(&win.MF_MT_SUBTYPE)
 		fs, _ := t.GetUINT64(&win.MF_MT_FRAME_SIZE)
 		fr, _ := t.GetUINT64(&win.MF_MT_FRAME_RATE)
-		m := Mode{FourCC: win.FourCC(sub), Width: int(fs >> 32), Height: int(fs & 0xffffffff)}
+		m := Mode{FourCC: win.SubtypeName(sub), Width: int(fs >> 32), Height: int(fs & 0xffffffff)}
 		if d := fr & 0xffffffff; d != 0 {
 			m.FPS = float64(fr>>32) / float64(d)
 		}

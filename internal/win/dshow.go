@@ -44,6 +44,8 @@ var (
 	IID_ISampleGrabberCB           = guid(0x0579154a, 0x2b53, 0x4994, 0xb0, 0xd0, 0xe7, 0x73, 0x14, 0x8e, 0xff, 0x85)
 	PIN_CATEGORY_CAPTURE           = guid(0xfb6c4281, 0x0353, 0x11d1, 0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba)
 	MEDIATYPE_Video                = MFMediaType_Video
+	MEDIASUBTYPE_RGB24             = guid(0xe436eb7d, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70)
+	MEDIASUBTYPE_RGB32             = guid(0xe436eb7e, 0x524f, 0x11ce, 0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70)
 	FORMAT_VideoInfo               = guid(0x05589f80, 0xc356, 0x11ce, 0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a)
 	FORMAT_VideoInfo2              = guid(0xf72a76a0, 0xeb0a, 0x11d0, 0xac, 0xe4, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba)
 	errNoVideoInfo                 = errors.New("media type has no VIDEOINFOHEADER")
@@ -132,6 +134,44 @@ func (m *AMMediaType) Video() (w, h int, interval int64, err error) {
 		h = -h
 	}
 	return w, h, interval, nil
+}
+
+// DShowSubtypeName names a DirectShow video subtype GUID: "RGB24" / "RGB32"
+// for MEDIASUBTYPE_RGB24 / MEDIASUBTYPE_RGB32, or the FourCC / MF subtype name.
+func DShowSubtypeName(g GUID) string {
+	switch g {
+	case MEDIASUBTYPE_RGB24:
+		return "RGB24"
+	case MEDIASUBTYPE_RGB32:
+		return "RGB32"
+	}
+	return SubtypeName(g)
+}
+
+// DShowSubtypeGUID returns the DirectShow subtype GUID for name ("RGB24",
+// "RGB32", or a 4-character FourCC like "NV12", "P010", "YUY2").
+func DShowSubtypeGUID(name string) GUID {
+	switch name {
+	case "RGB24":
+		return MEDIASUBTYPE_RGB24
+	case "RGB32":
+		return MEDIASUBTYPE_RGB32
+	}
+	return VideoFormatGUID(name)
+}
+
+// BottomUp reports whether an uncompressed RGB media type is stored bottom-up
+// (positive BITMAPINFOHEADER.biHeight in DirectShow).
+func (m *AMMediaType) BottomUp() bool {
+	if m.SubType != MEDIASUBTYPE_RGB24 && m.SubType != MEDIASUBTYPE_RGB32 {
+		return false
+	}
+	off, err := m.bmiOffset()
+	if err != nil {
+		return false
+	}
+	f := m.format()
+	return int32(binary.LittleEndian.Uint32(f[off+8:])) > 0
 }
 
 // SetInterval sets AvgTimePerFrame (100 ns), at offset 40 in both

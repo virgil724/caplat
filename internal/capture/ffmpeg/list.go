@@ -61,7 +61,7 @@ func ParseModes(out string) []Mode {
 }
 
 // preference ranks raw formats; compressed ones come last.
-var preference = []string{"nv12", "yuyv422", "yuv420p", "uyvy422", "rgb24", "bgr24", "bgr0"}
+var preference = []string{"nv12", "yuyv422", "yuv420p", "uyvy422", "p010le", "rgb24", "bgr24", "bgr0"}
 
 func rank(f string) int {
 	for i, p := range preference {

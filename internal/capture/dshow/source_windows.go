@@ -35,7 +35,11 @@ type Mode struct {
 	FPS           float64
 }
 
-var lumaFormats = map[string]int{"NV12": 0, "I420": 1, "IYUV": 1, "YV12": 1, "YUY2": 2}
+var lumaFormats = map[string]int{
+	"NV12": 0, "I420": 1, "IYUV": 1, "YV12": 1,
+	"YUY2": 2, "UYVY": 2,
+	"P010": 3, "RGB32": 4, "RGB24": 5,
+}
 
 func withCOM(f func() error) error {
 	runtime.LockOSThread()
@@ -138,7 +142,7 @@ func (s *Source) run(cfg Config, now func() int64, onFrame func(capture.Frame), 
 		return err
 	}
 
-	mode, err := setFormat(cgb, src, cfg)
+	mode, bottomUp, err := setFormat(cgb, src, cfg)
 	if err != nil {
 		return err
 	}
@@ -159,37 +163,32 @@ func (s *Source) run(cfg Config, now func() int64, onFrame func(capture.Frame), 
 	defer sg.Release()
 
 	w, h := mode.Width, mode.Height
-	yuy2 := mode.FourCC == "YUY2"
+	planar420 := mode.FourCC == "NV12" || mode.FourCC == "I420" || mode.FourCC == "IYUV" || mode.FourCC == "YV12" || mode.FourCC == "P010"
 	var luma []byte
-	if yuy2 {
+	if capture.NeedsLumaBuffer(mode.FourCC) {
 		luma = make([]byte, w*h)
 	}
 	s.cb = win.NewGrabberCallback(func(sample win.Object) {
 		arrive := now()
 		data := win.SampleData(sample)
-		f := capture.Frame{QPC: arrive}
-		if yuy2 {
-			stride := len(data) / h // rows may be padded
-			if stride < w*2 {
-				return
-			}
-			for y := 0; y < h; y++ {
-				row := data[y*stride:]
-				for x := 0; x < w; x++ {
-					luma[y*w+x] = row[2*x]
-				}
-			}
-			f.Y, f.Stride = luma, w
+		var stride int
+		if planar420 {
+			stride = len(data) * 2 / (h * 3) // 4:2:0: Y plane, then h/2 rows of chroma
 		} else {
-			stride := len(data) * 2 / (h * 3) // 4:2:0: Y plane, then h/2 rows of chroma
-			if stride < w {
-				return
-			}
-			f.Y, f.Stride = data[:stride*h], stride
+			stride = len(data) / h // packed rows may be padded (e.g. 4-byte DIB alignment)
 		}
-		onFrame(f)
+		y, yStride, raw, rawPitch, ok := capture.ExtractLuma(mode.FourCC, data, stride, w, h, bottomUp, luma)
+		if !ok {
+			return
+		}
+		onFrame(capture.Frame{
+			Y: y, Stride: yStride,
+			Data: raw, Pitch: rawPitch,
+			FourCC: mode.FourCC, Width: w, Height: h,
+			QPC: arrive,
+		})
 	})
-	if err := win.SampleGrabber(sg, win.VideoFormatGUID(mode.FourCC), s.cb); err != nil {
+	if err := win.SampleGrabber(sg, win.DShowSubtypeGUID(mode.FourCC), s.cb); err != nil {
 		return fmt.Errorf("SampleGrabber: %w", err)
 	}
 
@@ -233,15 +232,15 @@ func (s *Source) run(cfg Config, now func() int64, onFrame func(capture.Frame), 
 // setFormat picks the capture pin's capability of the requested size (NV12
 // first for "auto"), sets the frame interval closest to cfg.FPS within its
 // limits, and applies it.
-func setFormat(cgb, src win.Object, cfg Config) (Mode, error) {
+func setFormat(cgb, src win.Object, cfg Config) (Mode, bool, error) {
 	sc, err := win.StreamConfig(cgb, src)
 	if err != nil {
-		return Mode{}, fmt.Errorf("capture pin format: %w", err)
+		return Mode{}, false, fmt.Errorf("capture pin format: %w", err)
 	}
 	defer sc.Release()
 	n, err := win.StreamCaps(sc)
 	if err != nil {
-		return Mode{}, err
+		return Mode{}, false, err
 	}
 	want := strings.ToUpper(cfg.Format)
 	interval := int64(math.Round(1e7 / cfg.FPS))
@@ -253,7 +252,7 @@ func setFormat(cgb, src win.Object, cfg Config) (Mode, error) {
 		if err != nil {
 			continue
 		}
-		cc := win.FourCC(mt.SubType)
+		cc := win.DShowSubtypeName(mt.SubType)
 		w, h, _, verr := mt.Video()
 		win.DeleteMediaType(mt)
 		if verr != nil || w != cfg.Width || h != cfg.Height {
@@ -277,17 +276,18 @@ func setFormat(cgb, src win.Object, cfg Config) (Mode, error) {
 		}
 	}
 	if bestIdx < 0 {
-		return Mode{}, fmt.Errorf("no usable %dx%d format (format %s); the device offers %v", cfg.Width, cfg.Height, cfg.Format, seen)
+		return Mode{}, false, fmt.Errorf("no usable %dx%d format (format %s); the device offers %v", cfg.Width, cfg.Height, cfg.Format, seen)
 	}
 	mt, _, err := win.StreamCap(sc, bestIdx)
 	if err != nil {
-		return Mode{}, err
+		return Mode{}, false, err
 	}
 	defer win.DeleteMediaType(mt)
 	mt.SetInterval(bestInterval)
-	mode := Mode{FourCC: win.FourCC(mt.SubType), Width: cfg.Width, Height: cfg.Height, FPS: 1e7 / float64(bestInterval)}
+	mode := Mode{FourCC: win.DShowSubtypeName(mt.SubType), Width: cfg.Width, Height: cfg.Height, FPS: 1e7 / float64(bestInterval)}
+	bottomUp := mt.BottomUp()
 	if err := win.SetStreamFormat(sc, mt); err != nil {
-		return Mode{}, fmt.Errorf("set %s %dx%d@%.3f: %w", mode.FourCC, mode.Width, mode.Height, mode.FPS, err)
+		return Mode{}, false, fmt.Errorf("set %s %dx%d@%.3f: %w", mode.FourCC, mode.Width, mode.Height, mode.FPS, err)
 	}
-	return mode, nil
+	return mode, bottomUp, nil
 }
