@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -120,13 +121,17 @@ type fakeV4L2Device struct {
 	streamOn    bool
 	wakeCh      chan struct{}
 
-	qbufHistory []uint32
-	minQueued   int
-	frameSource func(seq int, buf []byte) v4l2Buffer
-	nextSeq     int
-	maxFrames   int
-	pauseAtSeq  int
-	resumeCh    chan struct{}
+	qbufHistory    []uint32
+	minQueued      int
+	frameSource    func(seq int, buf []byte) v4l2Buffer
+	nextSeq        int
+	maxFrames      int
+	pauseAtSeq     int
+	resumeCh       chan struct{}
+	streamOnErrs   []error
+	streamOnCalls  int
+	streamOffCalls int
+	streamOnQueued []int
 }
 
 func newFakeCaptureDevice(card string, fmts []fakeFmtSpec) *fakeV4L2Device {
@@ -378,11 +383,23 @@ func (d *fakeV4L2Device) Ioctl(req uintptr, ptr unsafe.Pointer) error {
 		return nil
 
 	case vidiocStreamOn:
+		d.streamOnCalls++
+		d.streamOnQueued = append(d.streamOnQueued, len(d.queued))
+		if len(d.streamOnErrs) > 0 {
+			err := d.streamOnErrs[0]
+			d.streamOnErrs = d.streamOnErrs[1:]
+			if err != nil {
+				return err
+			}
+		}
 		d.streamOn = true
 		return nil
 
 	case vidiocStreamOff:
+		d.streamOffCalls++
 		d.streamOn = false
+		d.queued = nil
+		d.ready = nil
 		return nil
 	}
 	return errors.New("unsupported ioctl")
@@ -651,4 +668,118 @@ func TestHoldReleaseAccountingAndNonStarvation(t *testing.T) {
 	if ts := src.TimestampInfo(); ts.Source != "SOE" || ts.HWTimestamps != "0" {
 		t.Errorf("TimestampInfo = %+v", ts)
 	}
+}
+
+func TestStreamOnRetryOnENOENT(t *testing.T) {
+	const w, h = 320, 180
+	newDev := func(errs ...error) (*fakeV4L2Device, *fakeSystem) {
+		dev := newFakeCaptureDevice("AVT GC553", []fakeFmtSpec{
+			{fourcc: "NV12", w: w, h: h, fps: [][2]uint32{{1, 60}}},
+		})
+		dev.streamOnErrs = errs
+		dev.frameSource = func(seq int, buf []byte) v4l2Buffer {
+			writeBarcodeNV12(buf, w, h, uint32(seq))
+			return v4l2Buffer{
+				Flags:         v4l2BufFlagTimestampMonotonic | v4l2BufFlagTstampSrcSOE,
+				TimestampSec:  10,
+				TimestampUsec: int64(seq) * 1000,
+				BytesUsed:     uint32(len(buf)),
+			}
+		}
+		sys := &fakeSystem{
+			nodes: map[string]*fakeV4L2Device{"/dev/video0": dev},
+		}
+		return dev, sys
+	}
+
+	t.Run("succeeds_on_retry", func(t *testing.T) {
+		dev, sys := newDev(syscall.ENOENT, nil)
+		gotFrame := make(chan struct{}, 4)
+		clk := int64(10_100_000_000)
+		src, err := startWith(sys, Config{
+			Device: "/dev/video0", Width: w, Height: h, FPS: 60, Format: "auto", Buffers: 4,
+		}, func() int64 { return clk }, 1_000_000_000, func(capture.Frame) {
+			select {
+			case gotFrame <- struct{}{}:
+			default:
+			}
+		})
+		if err != nil {
+			t.Fatalf("startWith: %v", err)
+		}
+		select {
+		case <-gotFrame:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for frame after STREAMON retry")
+		}
+		dev.mu.Lock()
+		onCalls := dev.streamOnCalls
+		offCalls := dev.streamOffCalls
+		queuedPerOn := append([]int(nil), dev.streamOnQueued...)
+		dev.mu.Unlock()
+		if onCalls != 2 || offCalls != 1 {
+			t.Errorf("streamOnCalls=%d streamOffCalls=%d, want 2/1", onCalls, offCalls)
+		}
+		if len(queuedPerOn) != 2 || queuedPerOn[0] != 4 || queuedPerOn[1] != 4 {
+			t.Errorf("queued buffers at STREAMON = %v, want [4 4]", queuedPerOn)
+		}
+		src.Stop()
+		if err := <-src.Done(); err != nil {
+			t.Fatalf("Done() = %v", err)
+		}
+	})
+
+	t.Run("no_retry_on_other_error", func(t *testing.T) {
+		dev, sys := newDev(syscall.EBUSY)
+		_, err := startWith(sys, Config{
+			Device: "/dev/video0", Width: w, Height: h, FPS: 60, Format: "auto", Buffers: 4,
+		}, func() int64 { return 1000 }, 1_000_000_000, func(capture.Frame) {})
+		if err == nil {
+			t.Fatal("expected error on EBUSY")
+		}
+		dev.mu.Lock()
+		onCalls := dev.streamOnCalls
+		offCalls := dev.streamOffCalls
+		closed := dev.closed
+		unmapped := append([]bool(nil), dev.unmapped...)
+		dev.mu.Unlock()
+		if onCalls != 1 || offCalls != 0 {
+			t.Errorf("streamOnCalls=%d streamOffCalls=%d, want 1/0", onCalls, offCalls)
+		}
+		if !closed {
+			t.Errorf("device not closed after STREAMON failure")
+		}
+		for i, u := range unmapped {
+			if !u {
+				t.Errorf("buffer %d not unmapped after STREAMON failure", i)
+			}
+		}
+	})
+
+	t.Run("fails_if_retry_also_enoent", func(t *testing.T) {
+		dev, sys := newDev(syscall.ENOENT, syscall.ENOENT)
+		_, err := startWith(sys, Config{
+			Device: "/dev/video0", Width: w, Height: h, FPS: 60, Format: "auto", Buffers: 4,
+		}, func() int64 { return 1000 }, 1_000_000_000, func(capture.Frame) {})
+		if err == nil {
+			t.Fatal("expected error when retry also returns ENOENT")
+		}
+		dev.mu.Lock()
+		onCalls := dev.streamOnCalls
+		offCalls := dev.streamOffCalls
+		closed := dev.closed
+		unmapped := append([]bool(nil), dev.unmapped...)
+		dev.mu.Unlock()
+		if onCalls != 2 || offCalls != 1 {
+			t.Errorf("streamOnCalls=%d streamOffCalls=%d, want 2/1", onCalls, offCalls)
+		}
+		if !closed {
+			t.Errorf("device not closed after STREAMON retry failure")
+		}
+		for i, u := range unmapped {
+			if !u {
+				t.Errorf("buffer %d not unmapped after STREAMON retry failure", i)
+			}
+		}
+	})
 }

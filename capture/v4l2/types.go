@@ -4,16 +4,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/virgil724/caplat/capture"
 )
+
+var streamOnRetryDelay = 50 * time.Millisecond
 
 // ErrUnsupported is returned on non-Linux operating systems.
 var ErrUnsupported = errors.New("v4l2: only supported on Linux")
@@ -851,7 +856,32 @@ func (s *Source) run(sys v4l2System, path string, cfg Config, now func() int64, 
 
 	bufType := uint32(v4l2BufTypeVideoCapture)
 	if err := dev.Ioctl(vidiocStreamOn, unsafe.Pointer(&bufType)); err != nil {
-		return fmt.Errorf("VIDIOC_STREAMON: %w", err)
+		if !isENOENT(err) {
+			return fmt.Errorf("VIDIOC_STREAMON: %w", err)
+		}
+		// Some USB capture cards fail the first URB submission (-ENOENT) right
+		// after enumeration; reset the queue with STREAMOFF, re-QBUF, and retry once.
+		_ = dev.Ioctl(vidiocStreamOff, unsafe.Pointer(&bufType))
+		s.mu.Lock()
+		s.queuedCount = 0
+		for i := range s.bufs {
+			s.bufs[i].state = bufUnmapped
+		}
+		s.mu.Unlock()
+		time.Sleep(streamOnRetryDelay)
+		for i := uint32(0); i < uint32(len(s.bufs)); i++ {
+			q := v4l2Buffer{Index: i, Type: v4l2BufTypeVideoCapture, Memory: v4l2MemoryMMAP}
+			if qerr := dev.Ioctl(vidiocQBuf, unsafe.Pointer(&q)); qerr != nil {
+				return fmt.Errorf("VIDIOC_QBUF(%d) on STREAMON retry: %w", i, qerr)
+			}
+			s.mu.Lock()
+			s.bufs[i].state = bufQueued
+			s.queuedCount++
+			s.mu.Unlock()
+		}
+		if err2 := dev.Ioctl(vidiocStreamOn, unsafe.Pointer(&bufType)); err2 != nil {
+			return fmt.Errorf("VIDIOC_STREAMON (retry): %w", err2)
+		}
 	}
 	cleanupEarly = false
 	defer s.cleanupStream(dev, true)
@@ -1104,4 +1134,13 @@ func (s *Source) cleanupStream(dev v4l2Device, streaming bool) {
 
 func isEAGAIN(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "resource temporarily unavailable") || strings.Contains(err.Error(), "EAGAIN"))
+}
+
+func isENOENT(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) ||
+		strings.Contains(err.Error(), "no such file or directory") ||
+		strings.Contains(err.Error(), "ENOENT")
 }
