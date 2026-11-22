@@ -127,6 +127,7 @@ type fakePCMDriver struct {
 	injectEPIPE bool
 	epipeSent   bool
 	pktCount    atomic.Int32
+	lastHW      hwConfig
 }
 
 func (d *fakePCMDriver) Open(name string, stream int32, mode int32) (pcmHandle, int32, error) {
@@ -142,6 +143,9 @@ func (d *fakePCMDriver) Open(name string, stream int32, mode int32) (pcmHandle, 
 func (d *fakePCMDriver) Close(pcmHandle) error { return nil }
 
 func (d *fakePCMDriver) Configure(_ pcmHandle, cfg hwConfig, _ bool) (negotiatedHW, error) {
+	d.mu.Lock()
+	d.lastHW = cfg
+	d.mu.Unlock()
 	return negotiatedHW{
 		Format: FormatS16LE, Rate: cfg.Rate, Channels: cfg.Channels,
 		PeriodFrames: 480, BufferFrames: 1920,
@@ -221,5 +225,26 @@ func TestFakeDriverCaptureEPIPEAndBusyFallback(t *testing.T) {
 	}
 	if p1.DeviceQPC != 0 {
 		t.Errorf("software mixer should suppress hw DeviceQPC, got %d", p1.DeviceQPC)
+	}
+}
+
+func TestPlaybackBufferOption(t *testing.T) {
+	for _, c := range []struct {
+		period, buffer time.Duration
+		wantUS         uint32
+	}{
+		{10 * time.Millisecond, 0, 30000},                    // default floor
+		{5 * time.Millisecond, 15 * time.Millisecond, 15000}, // passthrough
+		{5 * time.Millisecond, 2 * time.Millisecond, 10000},  // clamped to 2 periods
+	} {
+		d := &fakePCMDriver{}
+		pb, err := openPlaybackWith(d, PlaybackConfig{Device: "hw:0,0", Period: c.period, Buffer: c.buffer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.lastHW.BufferUS != c.wantUS {
+			t.Errorf("period %v buffer %v: BufferUS = %d, want %d", c.period, c.buffer, d.lastHW.BufferUS, c.wantUS)
+		}
+		pb.Close()
 	}
 }

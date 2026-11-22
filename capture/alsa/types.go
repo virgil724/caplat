@@ -101,10 +101,10 @@ func (d DeviceInfo) DisplayName() string {
 
 // Config describes an ALSA capture stream.
 type Config struct {
-	Device string
-	Rate   int           // desired sample rate (0 -> 48000)
-	Channels int         // desired channels (0 -> 2)
-	Period time.Duration // desired period duration (0 -> 10 ms)
+	Device   string
+	Rate     int           // desired sample rate (0 -> 48000)
+	Channels int           // desired channels (0 -> 2)
+	Period   time.Duration // desired period duration (0 -> 10 ms)
 	// FallbackDefault allows opening "pipewire" or "default" when hw:X,Y
 	// fails with EBUSY; SoftwareMixer is set on the returned Capture.
 	FallbackDefault bool
@@ -150,10 +150,14 @@ func (c *Capture) stopped() bool {
 
 // PlaybackConfig describes an ALSA playback stream.
 type PlaybackConfig struct {
-	Device          string
-	Rate            int           // desired sample rate (0 -> 48000)
-	Channels        int           // desired channels (0 -> 2)
-	Period          time.Duration // desired period (0 -> 10 ms)
+	Device   string
+	Rate     int           // desired sample rate (0 -> 48000)
+	Channels int           // desired channels (0 -> 2)
+	Period   time.Duration // desired period (0 -> 10 ms)
+	// Buffer is the desired total buffer (0 -> max(3 periods, 30 ms)).
+	// Passthrough consumers use a short one (e.g. 3 x 5 ms) to keep
+	// output latency low.
+	Buffer          time.Duration
 	FallbackDefault bool
 }
 
@@ -168,9 +172,9 @@ type Playback struct {
 	ActualDevice  string
 	SoftwareMixer bool
 
-	drv    pcmDriver
-	h      pcmHandle
-	format int32
+	drv     pcmDriver
+	h       pcmHandle
+	format  int32
 	scratch []byte
 }
 
@@ -544,6 +548,9 @@ func openPlaybackWith(drv pcmDriver, cfg PlaybackConfig) (*Playback, error) {
 	}
 	periodUS := uint32(max(int64(cfg.Period/time.Microsecond), 1000))
 	bufferUS := max(periodUS*3, 30000)
+	if cfg.Buffer > 0 {
+		bufferUS = max(uint32(cfg.Buffer/time.Microsecond), periodUS*2)
+	}
 	hw, err := drv.Configure(h, hwConfig{
 		Rate: cfg.Rate, Channels: cfg.Channels, PeriodUS: periodUS, BufferUS: bufferUS,
 	}, true)
