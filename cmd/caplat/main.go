@@ -20,8 +20,10 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/virgil724/caplat/pkg/caplat"
@@ -196,10 +198,14 @@ func run(args []string) error {
 	ffOut := fs.String("ffmpeg-out", "", "extra ffmpeg options after -i")
 	fs.DurationVar(&cfg.Duration, "duration", 30*time.Second, "how long to measure (0 = until Esc / Ctrl+C)")
 	fs.DurationVar(&cfg.Interval, "interval", time.Minute, "print statistics every interval")
+	fs.IntVar(&cfg.Repeat, "repeat", 1, "number of runs, restarting the capture stream between runs (samples output phase)")
 	csvPath := fs.String("csv", "", "write every matched frame to this CSV file")
 	fs.BoolVar(&cfg.Force, "force", false, "allow measuring on the primary display")
 	fs.Parse(args)
 
+	if cfg.Repeat < 1 {
+		return fmt.Errorf("bad --repeat %d, want >= 1", cfg.Repeat)
+	}
 	w, h, err := parseSize(*size)
 	if err != nil {
 		return err
@@ -224,6 +230,15 @@ func run(args []string) error {
 		cfg.CSV = f
 	}
 
+	var outMu sync.Mutex
+	if cfg.Repeat > 1 {
+		cfg.OnRun = func(rr caplat.RunResult) {
+			outMu.Lock()
+			fprintRunSummary(os.Stdout, rr, cfg.Repeat)
+			outMu.Unlock()
+		}
+	}
+
 	updates := make(chan caplat.Update, 16)
 	done := make(chan struct{})
 	go func() {
@@ -234,11 +249,17 @@ func run(args []string) error {
 				if d := u.Interval.Device; d.N > 0 {
 					line += fmt.Sprintf("  | to driver timestamp p50 %.1f, after it %.1f", d.P50, u.Interval.Stats.P50-d.P50)
 				}
+				outMu.Lock()
 				fmt.Println(line)
+				outMu.Unlock()
 			}
 		}
 	}()
-	fmt.Println("measuring... (Esc or click the barcode window to stop)")
+	if cfg.Repeat > 1 {
+		fmt.Printf("measuring %d runs (%s each)... (Esc or click the barcode window to stop)\n", cfg.Repeat, cfg.Duration)
+	} else {
+		fmt.Println("measuring... (Esc or click the barcode window to stop)")
+	}
 	res, err := caplat.Run(ctx, cfg, updates)
 	close(updates)
 	<-done
@@ -279,6 +300,9 @@ func printSetup(s caplat.Setup) {
 }
 
 func printResult(r caplat.Result) {
+	if len(r.Runs) > 0 {
+		fprintRepeatSummary(os.Stdout, r.Runs)
+	}
 	c := r.Counts
 	fmt.Printf("\nlatency vblank -> arrival over %s\n  %s\n", round(r.Elapsed), caplat.FormatStats(r.Total))
 	fmt.Printf("  captured %d frames, barcode unreadable %d, presented but not captured %d, captured without vblank %d, mismatched %d\n",
@@ -293,6 +317,62 @@ func printResult(r caplat.Result) {
 		fmt.Printf("  vblank -> driver timestamp:  %s\n", caplat.FormatStats(d))
 		fmt.Printf("  driver timestamp -> caplat:  p50 %.1f ms (rest of the frame over USB, driver, %s)\n", r.Total.P50-d.P50, driverName)
 	}
+}
+
+func fprintRunSummary(w io.Writer, rr caplat.RunResult, totalRuns int) {
+	if rr.Total.N == 0 {
+		fmt.Fprintf(w, "run %d/%d: n=0\n", rr.Run, totalRuns)
+		return
+	}
+	line := fmt.Sprintf("run %d/%d: n=%d  p50 %.1f ms  p99 %.1f ms", rr.Run, totalRuns, rr.Total.N, rr.Total.P50, rr.Total.P99)
+	if rr.Device.N > 0 {
+		line += fmt.Sprintf("  phase %.1f ms", rr.Device.P50)
+	}
+	fmt.Fprintln(w, line)
+}
+
+func fprintRepeatSummary(w io.Writer, runs []caplat.RunResult) {
+	var p50s, phases []float64
+	for _, rr := range runs {
+		if rr.Total.N > 0 && !math.IsNaN(rr.Total.P50) {
+			p50s = append(p50s, rr.Total.P50)
+		}
+		if rr.Device.N > 0 && !math.IsNaN(rr.Device.P50) {
+			phases = append(phases, rr.Device.P50)
+		}
+	}
+	fmt.Fprintf(w, "\nrepeat summary (%d runs)\n", len(runs))
+	if len(p50s) > 0 {
+		lo, med, hi := minMedMax(p50s)
+		fmt.Fprintf(w, "  run p50s:                        %s ms\n", formatFloatList(p50s))
+		fmt.Fprintf(w, "  p50 min/median/max:              %.1f / %.1f / %.1f ms\n", lo, med, hi)
+	}
+	if len(phases) > 0 {
+		plo, pmed, phi := minMedMax(phases)
+		fmt.Fprintf(w, "  phase (vblank -> driver ts p50): %s ms\n", formatFloatList(phases))
+		fmt.Fprintf(w, "  phase min/median/max:            %.1f / %.1f / %.1f ms\n", plo, pmed, phi)
+	}
+}
+
+func minMedMax(vals []float64) (lo, med, hi float64) {
+	s := append([]float64(nil), vals...)
+	sort.Float64s(s)
+	n := len(s)
+	lo, hi = s[0], s[n-1]
+	if n%2 == 1 {
+		med = s[n/2]
+	} else {
+		med = (s[n/2-1] + s[n/2]) / 2
+	}
+	return lo, med, hi
+}
+
+func formatFloatList(vals []float64) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = fmt.Sprintf("%.1f", v)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func runAudio(args []string) error {

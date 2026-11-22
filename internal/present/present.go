@@ -6,6 +6,7 @@ package present
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 
 	"github.com/virgil724/caplat/internal/barcode"
 	"github.com/virgil724/caplat/displays"
@@ -64,6 +65,98 @@ func Run(ctx context.Context, cfg Config, p Presenter) error {
 			return err
 		}
 	}
+}
+
+// Segment describes one measurement run inside a persistent presenter session.
+type Segment struct {
+	Ctx        context.Context // cancels just this segment (optional)
+	WarmFrames int
+	Frames     uint64
+	Trailing   int // code-0 frames after Frames to flush final vblank feedback
+	OnVblank   func(frame uint64, qpc int64)
+	OnStart    func()
+	Done       chan<- error // receives completion error (buffered 1)
+}
+
+// RunSession keeps p open across multiple Segments received from segs until
+// ctx is cancelled, segs is closed, or a segment fails or aborts.
+func RunSession(ctx context.Context, d displays.Display, p Presenter, segs <-chan Segment) error {
+	var vblank atomic.Pointer[func(uint64, int64)]
+	if err := p.Open(d, func(frame uint64, qpc int64) {
+		if fn := vblank.Load(); fn != nil && *fn != nil {
+			(*fn)(frame, qpc)
+		}
+	}); err != nil {
+		return err
+	}
+	defer p.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case seg, ok := <-segs:
+			if !ok {
+				return nil
+			}
+			err := runSegment(ctx, p, &vblank, seg)
+			if seg.Done != nil {
+				seg.Done <- err
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func runSegment(ctx context.Context, p Presenter, vblank *atomic.Pointer[func(uint64, int64)], seg Segment) error {
+	if seg.OnVblank != nil {
+		fn := seg.OnVblank
+		vblank.Store(&fn)
+	} else {
+		vblank.Store(nil)
+	}
+	segCtx := seg.Ctx
+	if segCtx == nil {
+		segCtx = context.Background()
+	}
+
+	presentZero := func(n int) error {
+		for i := 0; i < n; i++ {
+			if ctx.Err() != nil || segCtx.Err() != nil {
+				return nil
+			}
+			if err := p.Present(0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := presentZero(seg.WarmFrames); err != nil {
+		return err
+	}
+
+	var frame, measured uint64
+	for {
+		if ctx.Err() != nil || segCtx.Err() != nil {
+			return nil
+		}
+		if seg.Frames > 0 && measured >= seg.Frames {
+			break
+		}
+		frame = barcode.NextFrame(frame)
+		measured++
+		if measured == 1 && seg.OnStart != nil {
+			seg.OnStart()
+		}
+		if err := p.Present(frame); err != nil {
+			return err
+		}
+	}
+
+	return presentZero(seg.Trailing)
 }
 
 // DrawBand writes a barcode row of cells into a 32-bit BGRA/RGBA buffer of

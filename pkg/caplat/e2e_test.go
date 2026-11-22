@@ -66,6 +66,8 @@ type mockPresenter struct {
 	frameDelay time.Duration
 	dropAfter  int // 0 = deliver all; <0 = drop all; >0 = stop delivering after N calls
 	calls      int
+	openCount  int
+	closeCount int
 
 	band []byte
 	luma []byte
@@ -74,6 +76,7 @@ type mockPresenter struct {
 func (p *mockPresenter) Open(d displays.Display, onVblank func(uint64, int64)) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.openCount++
 	p.onVblank = onVblank
 	p.outW, p.outH = d.Width, d.Height
 	cell := p.outW / barcode.Cells
@@ -86,6 +89,8 @@ func (p *mockPresenter) Present(show uint64) error {
 	p.mu.Lock()
 	onFrame := p.onFrame
 	onVblank := p.onVblank
+	totMS := append([]float64(nil), p.totMS...)
+	devMS := append([]float64(nil), p.devMS...)
 	p.mu.Unlock()
 
 	cell := p.outW / barcode.Cells
@@ -111,9 +116,9 @@ func (p *mockPresenter) Present(show uint64) error {
 	if show == 0 {
 		arrTick = vblank + 10_000_000
 	} else {
-		i := int(show-1) % len(p.totMS)
-		totTicks := int64(math.Round(p.totMS[i] * 1e6))
-		devTicks := int64(math.Round(p.devMS[i] * 1e6))
+		i := int(show-1) % len(totMS)
+		totTicks := int64(math.Round(totMS[i] * 1e6))
+		devTicks := int64(math.Round(devMS[i] * 1e6))
 		arrTick = vblank + totTicks
 		devTick = vblank + devTicks
 		if onVblank != nil {
@@ -141,12 +146,21 @@ func (p *mockPresenter) Present(show uint64) error {
 	return nil
 }
 
-func (p *mockPresenter) Close() error { return nil }
+func (p *mockPresenter) Close() error {
+	p.mu.Lock()
+	p.closeCount++
+	p.mu.Unlock()
+	return nil
+}
 
 type mockVideoBackend struct {
-	disps []Display
-	devs  []string
-	pres  *mockPresenter
+	mu         sync.Mutex
+	disps      []Display
+	devs       []string
+	pres       *mockPresenter
+	startCount int
+	stopCount  int
+	onStart    func(run int)
 }
 
 func (m *mockVideoBackend) Displays() ([]Display, error)                    { return m.disps, nil }
@@ -166,10 +180,22 @@ func (m *mockVideoBackend) PrepareCapture(_ context.Context, cfg Config, d Displ
 	return Setup{CaptureMode: fmt.Sprintf("%dx%d@%s nv12 (Mock)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate())}, m, nil
 }
 func (m *mockVideoBackend) Start(_ context.Context, _ func() int64, _ int64, onFrame func(capture.Frame)) (capture.Source, string, error) {
+	m.mu.Lock()
+	m.startCount++
+	run := m.startCount
+	onStart := m.onStart
+	m.mu.Unlock()
+	if onStart != nil {
+		onStart(run)
+	}
 	m.pres.mu.Lock()
 	m.pres.onFrame = onFrame
 	m.pres.mu.Unlock()
-	return newMockCaptureSource(nil), "", nil
+	return newMockCaptureSource(func() {
+		m.mu.Lock()
+		m.stopCount++
+		m.mu.Unlock()
+	}), "", nil
 }
 func (m *mockVideoBackend) NewPresenter(string) present.Presenter { return m.pres }
 
@@ -617,4 +643,118 @@ func TestStallDetection(t *testing.T) {
 	t.Run("stalls_mid_run", func(t *testing.T) {
 		runStallCase(t, 40*time.Millisecond, 15)
 	})
+}
+
+func TestSyntheticVideoRepeatE2E(t *testing.T) {
+	const freq = 1_000_000_000
+	var clk atomic.Int64
+	clk.Store(1_000_000_000_000)
+
+	phases := []struct {
+		totMS float64
+		devMS float64
+	}{
+		{totMS: 16.25, devMS: 0.25},
+		{totMS: 18.85, devMS: 5.75},
+		{totMS: 35.55, devMS: 18.85},
+	}
+
+	pres := &mockPresenter{
+		capW: 1280, capH: 720,
+		baseTick: clk.Load(),
+		clock:    &clk,
+	}
+	var vb *mockVideoBackend
+	vb = &mockVideoBackend{
+		disps: []Display{
+			{Name: "DP-2", FriendlyName: "AVT GC553", Width: 1920, Height: 1080, RefreshNum: 60, RefreshDen: 1, LikelyCard: true},
+		},
+		devs: []string{"Live Gamer Ultra-Video"},
+		pres: pres,
+		onStart: func(run int) {
+			vb.mu.Lock()
+			stops := vb.stopCount
+			vb.mu.Unlock()
+			if stops != run-1 {
+				t.Errorf("onStart(run=%d): previous capture not stopped yet (stopCount=%d)", run, stops)
+			}
+			ph := phases[run-1]
+			pres.mu.Lock()
+			pres.totMS = []float64{ph.totMS}
+			pres.devMS = []float64{ph.devMS}
+			pres.mu.Unlock()
+		},
+	}
+
+	// Verify --repeat > 1 without --duration is rejected cleanly.
+	if _, err := runWith(context.Background(), Config{Repeat: 2, Duration: 0}, nil, runDeps{vb: vb, now: clk.Load, freq: freq}); err == nil {
+		t.Fatal("expected error for Repeat > 1 with Duration == 0")
+	}
+
+	var onRunResults []RunResult
+	var csvBuf bytes.Buffer
+	res, err := runWith(context.Background(), Config{
+		Display:       "auto",
+		CaptureWidth:  1280,
+		CaptureHeight: 720,
+		Warmup:        100 * time.Millisecond, // 6 frames at 60 Hz
+		Duration:      time.Second,            // 60 frames; Settle=10 -> 50 counted per run
+		Repeat:        3,
+		CSV:           &csvBuf,
+		OnRun:         func(rr RunResult) { onRunResults = append(onRunResults, rr) },
+	}, nil, runDeps{
+		vb:         vb,
+		now:        clk.Load,
+		freq:       freq,
+		drainDelay: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("runWith: %v", err)
+	}
+
+	if vb.startCount != 3 || vb.stopCount != 3 {
+		t.Fatalf("capture start/stop = %d/%d, want 3/3", vb.startCount, vb.stopCount)
+	}
+	if pres.openCount != 1 || pres.closeCount != 1 {
+		t.Fatalf("presenter open/close = %d/%d, want 1/1 (presenter stays up across repeats)", pres.openCount, pres.closeCount)
+	}
+	if len(res.Runs) != 3 || len(onRunResults) != 3 {
+		t.Fatalf("runs=%d onRun=%d, want 3/3", len(res.Runs), len(onRunResults))
+	}
+	for i, ph := range phases {
+		rr := res.Runs[i]
+		if rr.Run != i+1 || rr.Total.N != 50 || rr.Device.N != 50 {
+			t.Fatalf("run %d unexpected stats: %+v", i+1, rr)
+		}
+		assertClose(t, fmt.Sprintf("run[%d].Total.P50", i), rr.Total.P50, ph.totMS, 0.05)
+		assertClose(t, fmt.Sprintf("run[%d].Device.P50", i), rr.Device.P50, ph.devMS, 0.05)
+	}
+	if res.Total.N != 150 || res.Device.N != 150 {
+		t.Fatalf("aggregate N=%d/%d, want 150/150", res.Total.N, res.Device.N)
+	}
+	assertClose(t, "aggregate.Total.P50", res.Total.P50, 18.85, 0.05)
+	assertClose(t, "aggregate.Device.P50", res.Device.P50, 5.75, 0.05)
+
+	lines := strings.Split(strings.TrimSpace(csvBuf.String()), "\n")
+	if len(lines) != 152 {
+		t.Fatalf("CSV lines = %d, want 152", len(lines))
+	}
+	if lines[1] != "run,frame,vblank_qpc,arrive_qpc,latency_ms,device_qpc,device_ms" {
+		t.Errorf("unexpected repeat CSV header: %q", lines[1])
+	}
+	rows, err := csv.NewReader(strings.NewReader(strings.Join(lines[2:], "\n"))).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	for idx, row := range rows {
+		wantRun := idx/50 + 1
+		gotRun, _ := strconv.Atoi(row[0])
+		if gotRun != wantRun {
+			t.Fatalf("csv[%d].run = %d, want %d", idx, gotRun, wantRun)
+		}
+		latMS, _ := strconv.ParseFloat(row[4], 64)
+		devMS, _ := strconv.ParseFloat(row[6], 64)
+		assertClose(t, fmt.Sprintf("csv[%d].latency_ms", idx), latMS, phases[wantRun-1].totMS, 0.005)
+		assertClose(t, fmt.Sprintf("csv[%d].device_ms", idx), devMS, phases[wantRun-1].devMS, 0.005)
+	}
 }

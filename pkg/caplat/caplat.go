@@ -88,8 +88,10 @@ type Config struct {
 	Duration      time.Duration // 0 = until the context ends or the user aborts
 	Interval      time.Duration // statistics window; default 1 minute
 	Warmup        time.Duration // default 2 s
+	Repeat        int           // number of runs, restarting capture between runs (<= 1 means 1)
 	Force         bool          // allow the primary display
 	CSV           io.Writer     // optional: one row per matched frame
+	OnRun         func(RunResult)
 }
 
 func (c *Config) defaults() {
@@ -113,6 +115,9 @@ func (c *Config) defaults() {
 	}
 	if c.Warmup <= 0 {
 		c.Warmup = 2 * time.Second
+	}
+	if c.Repeat <= 0 {
+		c.Repeat = 1
 	}
 }
 
@@ -146,6 +151,16 @@ type Update struct {
 	Device   Stats      // vblank -> driver timestamp so far (mf only)
 }
 
+// RunResult is the outcome of one run when Config.Repeat > 1.
+type RunResult struct {
+	Run     int // 1-based run number
+	Total   Stats
+	Device  Stats // vblank -> driver timestamp (N = 0 when unavailable)
+	Counts  Counts
+	Hist    Histogram
+	Elapsed time.Duration
+}
+
 // Result is the outcome of a run.
 type Result struct {
 	Setup     Setup
@@ -155,6 +170,7 @@ type Result struct {
 	Hist      Histogram
 	Device    Stats // vblank -> driver timestamp (mf only; N = 0 otherwise)
 	Elapsed   time.Duration
+	Runs      []RunResult // populated when Config.Repeat > 1
 }
 
 // FormatStats renders stats as one line.
