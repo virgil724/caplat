@@ -13,6 +13,9 @@ func ListDevices() ([]string, error) { return nil, ErrUnsupported }
 // ListModes is only supported on Linux.
 func ListModes(string) ([]Mode, error) { return nil, ErrUnsupported }
 
+// ListAllModes is only supported on Linux.
+func ListAllModes(string) ([]Mode, error) { return nil, ErrUnsupported }
+
 // Start is only supported on Linux.
 func Start(Config, func() int64, int64, func(capture.Frame)) (*Source, error) {
 	return nil, ErrUnsupported

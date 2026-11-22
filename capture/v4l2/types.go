@@ -419,7 +419,7 @@ func formatRank(want, fourcc string) int {
 	return -1
 }
 
-func listModesWith(dev v4l2Device) ([]Mode, error) {
+func listModesWith(dev v4l2Device, allFormats bool) ([]Mode, error) {
 	var modes []Mode
 	for idx := uint32(0); ; idx++ {
 		desc := v4l2FmtDesc{Index: idx, Type: v4l2BufTypeVideoCapture}
@@ -427,7 +427,7 @@ func listModesWith(dev v4l2Device) ([]Mode, error) {
 			break
 		}
 		cc := fourccToString(desc.PixelFormat)
-		if capture.DefaultPitch(cc, 1) == 0 {
+		if !allFormats && capture.DefaultPitch(cc, 1) == 0 {
 			continue
 		}
 		sizes := enumFrameSizes(dev, desc.PixelFormat)

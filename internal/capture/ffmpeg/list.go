@@ -75,6 +75,9 @@ func ParseV4L2Modes(out string) []Mode {
 			continue
 		}
 		format := strings.TrimSpace(lm[1])
+		if strings.EqualFold(format, "unsupported") {
+			continue
+		}
 		sizeSpec := lm[2]
 		add := func(md Mode) {
 			if !seen[md] {

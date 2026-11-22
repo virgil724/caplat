@@ -156,8 +156,7 @@ func ListDevices() ([]string, error) {
 	return out, nil
 }
 
-// ListModes lists the supported capture modes of device.
-func ListModes(device string) ([]Mode, error) {
+func listDeviceModes(device string, allFormats bool) ([]Mode, error) {
 	sys := linuxSystem{}
 	path, err := resolveDevicePath(sys, device)
 	if err != nil {
@@ -168,7 +167,18 @@ func ListModes(device string) ([]Mode, error) {
 		return nil, err
 	}
 	defer dev.Close()
-	return listModesWith(dev)
+	return listModesWith(dev, allFormats)
+}
+
+// ListModes lists the supported capturable modes of device.
+func ListModes(device string) ([]Mode, error) {
+	return listDeviceModes(device, false)
+}
+
+// ListAllModes lists all V4L2 modes advertised by device, including formats
+// such as MJPG that capture/v4l2 cannot decode in-process.
+func ListAllModes(device string) ([]Mode, error) {
+	return listDeviceModes(device, true)
 }
 
 // Start opens device, negotiates mode, maps >= 4 MMAP buffers, and invokes

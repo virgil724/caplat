@@ -18,22 +18,66 @@ var v4l2FormatNames = map[string]string{
 	"P010": "p010le",
 	"RGB3": "rgb24",
 	"BGR3": "bgr24",
+	"XR24": "bgr0",
+	"BGR4": "bgr0",
 	"MJPG": "mjpeg",
 	"H264": "h264",
+	"HEVC": "hevc",
 }
 
 // mergeModes returns primary plus the entries of extra whose format does not
 // appear in primary (e.g. mjpeg, which only the ffmpeg backend can decode).
-func mergeModes(primary, extra []Mode) []Mode {
-	have := map[string]bool{}
-	for _, m := range primary {
-		have[m.Format] = true
+// "Unsupported" rows are dropped, and extra entries without a frame rate inherit
+// their rate from matching entries in rateHints.
+func mergeModes(primary, extra, rateHints []Mode) []Mode {
+	type rateKey struct {
+		format     string
+		minW, minH int
+		maxW, maxH int
 	}
-	out := primary
-	for _, m := range extra {
-		if !have[m.Format] {
-			out = append(out, m)
+	type rateRange struct {
+		minFPS, maxFPS float64
+	}
+	rates := map[rateKey]rateRange{}
+	for _, m := range rateHints {
+		if m.MaxFPS <= 0 {
+			continue
 		}
+		k := rateKey{m.Format, m.MinW, m.MinH, m.MaxW, m.MaxH}
+		cur, ok := rates[k]
+		if !ok {
+			rates[k] = rateRange{minFPS: m.MinFPS, maxFPS: m.MaxFPS}
+			continue
+		}
+		if m.MaxFPS > cur.maxFPS {
+			cur.maxFPS = m.MaxFPS
+		}
+		if m.MinFPS > 0 && (cur.minFPS <= 0 || m.MinFPS < cur.minFPS) {
+			cur.minFPS = m.MinFPS
+		}
+		rates[k] = cur
+	}
+
+	have := map[string]bool{}
+	var out []Mode
+	for _, m := range primary {
+		if strings.EqualFold(m.Format, "unsupported") {
+			continue
+		}
+		have[m.Format] = true
+		out = append(out, m)
+	}
+	for _, m := range extra {
+		if strings.EqualFold(m.Format, "unsupported") || have[m.Format] {
+			continue
+		}
+		if m.MaxFPS <= 0 {
+			if r, ok := rates[rateKey{m.Format, m.MinW, m.MinH, m.MaxW, m.MaxH}]; ok && r.maxFPS > 0 {
+				m.MinFPS = r.minFPS
+				m.MaxFPS = r.maxFPS
+			}
+		}
+		out = append(out, m)
 	}
 	return out
 }

@@ -38,14 +38,25 @@ func (linuxVideoBackend) DevicesV4L2() ([]string, error)  { return v4l2.ListDevi
 
 // Modes lists the device's modes from V4L2 directly (ffmpeg's v4l2
 // listing has no frame rates), adding formats only ffmpeg can use (mjpeg)
-// from ffmpeg's listing, and falling back to ffmpeg entirely.
+// from ffmpeg's listing enriched with V4L2 frame intervals, and falling back
+// to ffmpeg entirely.
 func (linuxVideoBackend) Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error) {
 	ff, ffErr := ffmpeg.ListModes(ctx, ffmpegBin, device)
-	ms, err := v4l2.ListModes(device)
-	if err != nil || len(ms) == 0 {
+	all, err := v4l2.ListAllModes(device)
+	if err != nil || len(all) == 0 {
 		return ff, ffErr
 	}
-	return mergeModes(modesFromV4L2(ms), ff), nil
+	var native []v4l2.Mode
+	for _, m := range all {
+		if capture.DefaultPitch(m.FourCC, 1) != 0 {
+			native = append(native, m)
+		}
+	}
+	merged := mergeModes(modesFromV4L2(native), ff, modesFromV4L2(all))
+	if len(merged) == 0 {
+		return ff, ffErr
+	}
+	return merged, nil
 }
 
 func (linuxVideoBackend) ValidateBackend(backend string) error {

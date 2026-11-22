@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/signal"
@@ -130,6 +131,10 @@ func list(args []string) error {
 // printModes prints one line per format: its sizes, each with its top frame
 // rate.
 func printModes(modes []caplat.Mode) {
+	fprintModes(os.Stdout, modes)
+}
+
+func fprintModes(w io.Writer, modes []caplat.Mode) {
 	var order []string
 	byFmt := map[string][]string{}
 	seen := map[string]bool{}
@@ -138,7 +143,11 @@ func printModes(modes []caplat.Mode) {
 		if m.MinW != m.MaxW || m.MinH != m.MaxH {
 			size = fmt.Sprintf("%dx%d-%dx%d", m.MinW, m.MinH, m.MaxW, m.MaxH)
 		}
-		entry := fmt.Sprintf("%s@%g", size, math.Round(m.MaxFPS*100)/100)
+		rate := "?"
+		if m.MaxFPS > 0 {
+			rate = fmt.Sprintf("%g", math.Round(m.MaxFPS*100)/100)
+		}
+		entry := fmt.Sprintf("%s@%s", size, rate)
 		if seen[m.Format+entry] {
 			continue
 		}
@@ -153,7 +162,7 @@ func printModes(modes []caplat.Mode) {
 		if len(list) > 8 {
 			list = append(list[:8:8], fmt.Sprintf("... (%d more)", len(byFmt[f])-8))
 		}
-		fmt.Printf("      %-8s %s\n", f, strings.Join(list, "  "))
+		fmt.Fprintf(w, "      %-8s %s\n", f, strings.Join(list, "  "))
 	}
 }
 

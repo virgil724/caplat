@@ -89,3 +89,24 @@ func TestParseV4L2ModesAndPick(t *testing.T) {
 		t.Errorf("PickFormat(800x600@60 stepwise) = (%q, %v), want yuv420p", got, err)
 	}
 }
+
+func TestParseV4L2ModesDropsUnsupported(t *testing.T) {
+	const v4l2Out = `[video4linux2,v4l2 @ 0x55a1] Raw       :     yuyv422 :           YUYV 4:2:2 : 1920x1080 1280x720
+[video4linux2,v4l2 @ 0x55a1] Raw       : Unsupported :        'MJPG' (compressed) : 3840x2160 1920x1080
+[video4linux2,v4l2 @ 0x55a1] Compressed: Unsupported :                     Unknown : 1920x1080
+[video4linux2,v4l2 @ 0x55a1] Compressed:       mjpeg :                 Motion-JPEG : 3840x2160
+`
+	modes := ParseV4L2Modes(v4l2Out)
+	for _, m := range modes {
+		if strings.EqualFold(m.Format, "unsupported") {
+			t.Fatalf("ParseV4L2Modes retained Unsupported row: %+v", m)
+		}
+	}
+	if len(modes) != 3 {
+		t.Fatalf("got %d modes, want 3: %+v", len(modes), modes)
+	}
+	got, err := PickFormat(modes, 3840, 2160, 60)
+	if err != nil || got != "mjpeg" {
+		t.Errorf("PickFormat(3840x2160@60) = (%q, %v), want mjpeg", got, err)
+	}
+}

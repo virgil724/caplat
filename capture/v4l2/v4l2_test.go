@@ -783,3 +783,39 @@ func TestStreamOnRetryOnENOENT(t *testing.T) {
 		}
 	})
 }
+
+func TestListModesVsListAllModes(t *testing.T) {
+	dev := newFakeCaptureDevice("AVT GC553", []fakeFmtSpec{
+		{fourcc: "NV12", w: 1920, h: 1080, fps: [][2]uint32{{1, 60}, {1, 30}}},
+		{fourcc: "YUYV", w: 1280, h: 720, fps: [][2]uint32{{1, 60}}},
+		{fourcc: "MJPG", w: 3840, h: 2160, fps: [][2]uint32{{1, 60}, {1, 30}}},
+	})
+	capturable, err := listModesWith(dev, false)
+	if err != nil {
+		t.Fatalf("listModesWith(false): %v", err)
+	}
+	if len(capturable) != 3 {
+		t.Fatalf("capturable len = %d, want 3: %+v", len(capturable), capturable)
+	}
+	for _, m := range capturable {
+		if m.FourCC == "MJPG" {
+			t.Errorf("listModesWith(false) should not include non-capturable MJPG: %+v", m)
+		}
+	}
+	all, err := listModesWith(dev, true)
+	if err != nil {
+		t.Fatalf("listModesWith(true): %v", err)
+	}
+	if len(all) != 5 {
+		t.Fatalf("all len = %d, want 5: %+v", len(all), all)
+	}
+	var mjpgFPS []float64
+	for _, m := range all {
+		if m.FourCC == "MJPG" && m.Width == 3840 && m.Height == 2160 {
+			mjpgFPS = append(mjpgFPS, m.FPS)
+		}
+	}
+	if len(mjpgFPS) != 2 || mjpgFPS[0] != 60 || mjpgFPS[1] != 30 {
+		t.Errorf("MJPG FPS = %v, want [60 30]", mjpgFPS)
+	}
+}
