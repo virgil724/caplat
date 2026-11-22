@@ -18,6 +18,9 @@ import (
 	"github.com/virgil724/caplat/internal/win"
 )
 
+func defaultBackend() string      { return BackendMF }
+func defaultAudioBackend() string { return AudioWASAPI }
+
 func newVideoBackend() videoBackend { return windowsVideoBackend{} }
 func newAudioBackend() audioBackend { return windowsAudioBackend{} }
 
@@ -34,6 +37,7 @@ func (windowsVideoBackend) Devices(ctx context.Context, ffmpegBin string) ([]str
 
 func (windowsVideoBackend) DevicesMF() ([]string, error)    { return mf.ListDevices() }
 func (windowsVideoBackend) DevicesDShow() ([]string, error) { return dshow.ListDevices() }
+func (windowsVideoBackend) DevicesV4L2() ([]string, error)  { return nil, ErrUnsupported }
 
 func (windowsVideoBackend) Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error) {
 	return ffmpeg.ListModes(ctx, ffmpegBin, device)
@@ -42,6 +46,13 @@ func (windowsVideoBackend) Modes(ctx context.Context, ffmpegBin, device string) 
 func (windowsVideoBackend) ValidateBackend(backend string) error {
 	if backend != BackendFFmpeg && backend != BackendMF && backend != BackendDShow {
 		return fmt.Errorf("unknown backend %q (want %s, %s or %s)", backend, BackendMF, BackendDShow, BackendFFmpeg)
+	}
+	return nil
+}
+
+func (windowsVideoBackend) ValidatePresenter(presenter string) error {
+	if presenter != "" && presenter != PresenterAuto {
+		return fmt.Errorf("unknown presenter %q on Windows (want %s)", presenter, PresenterAuto)
 	}
 	return nil
 }
@@ -96,7 +107,7 @@ func (windowsVideoBackend) PrepareCapture(ctx context.Context, cfg Config, d Dis
 	return s, ffmpegStarter{cfg: ff}, nil
 }
 
-func (windowsVideoBackend) NewPresenter() present.Presenter { return present.New() }
+func (windowsVideoBackend) NewPresenter(string) present.Presenter { return present.New() }
 
 type dshowStarter struct{ cfg mf.Config }
 

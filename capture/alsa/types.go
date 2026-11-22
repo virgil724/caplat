@@ -252,13 +252,20 @@ func PCMName(device string) string {
 	if i := strings.LastIndexByte(s, '('); i >= 0 {
 		if j := strings.LastIndexByte(s, ')'); j > i+1 {
 			inner := strings.TrimSpace(s[i+1 : j])
-			if IsSoftwarePCM(inner) || strings.HasPrefix(inner, "hw:") ||
-				strings.HasPrefix(inner, "plughw:") || strings.HasPrefix(inner, "sysdefault:") {
+			if IsDirectPCM(inner) {
 				return inner
 			}
 		}
 	}
 	return s
+}
+
+// IsDirectPCM reports whether name is a direct ALSA PCM name ("default",
+// "pipewire", "pulse", "dmix...", "hw:...", "plughw:...", or "sysdefault:...").
+func IsDirectPCM(name string) bool {
+	low := strings.ToLower(strings.TrimSpace(name))
+	return IsSoftwarePCM(low) || strings.HasPrefix(low, "hw:") ||
+		strings.HasPrefix(low, "plughw:") || strings.HasPrefix(low, "sysdefault:")
 }
 
 // IsSoftwarePCM reports whether pcmName routes through a software mixer/server.

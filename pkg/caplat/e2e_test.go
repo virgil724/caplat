@@ -139,12 +139,14 @@ type mockVideoBackend struct {
 
 func (m *mockVideoBackend) Displays() ([]Display, error)                    { return m.disps, nil }
 func (m *mockVideoBackend) Devices(context.Context, string) ([]string, error) { return m.devs, nil }
-func (m *mockVideoBackend) DevicesMF() ([]string, error)                    { return m.devs, nil }
-func (m *mockVideoBackend) DevicesDShow() ([]string, error)                 { return m.devs, nil }
+func (m *mockVideoBackend) DevicesMF() ([]string, error)    { return m.devs, nil }
+func (m *mockVideoBackend) DevicesDShow() ([]string, error) { return m.devs, nil }
+func (m *mockVideoBackend) DevicesV4L2() ([]string, error)  { return m.devs, nil }
 func (m *mockVideoBackend) Modes(context.Context, string, string) ([]Mode, error) {
 	return nil, nil
 }
-func (m *mockVideoBackend) ValidateBackend(string) error { return nil }
+func (m *mockVideoBackend) ValidateBackend(string) error   { return nil }
+func (m *mockVideoBackend) ValidatePresenter(string) error { return nil }
 func (m *mockVideoBackend) ListCaptureDevices(context.Context, Config) ([]string, error) {
 	return m.devs, nil
 }
@@ -157,7 +159,7 @@ func (m *mockVideoBackend) Start(_ context.Context, _ func() int64, _ int64, onF
 	m.pres.mu.Unlock()
 	return newMockCaptureSource(nil), "", nil
 }
-func (m *mockVideoBackend) NewPresenter() present.Presenter { return m.pres }
+func (m *mockVideoBackend) NewPresenter(string) present.Presenter { return m.pres }
 
 func TestSyntheticVideoE2E(t *testing.T) {
 	const freq = 1_000_000_000
@@ -519,4 +521,17 @@ func (w *waitVideoBackend) PrepareCapture(_ context.Context, cfg Config, d Displ
 	return Setup{CaptureMode: fmt.Sprintf("%dx%d@%s nv12 (Mock)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate())}, w, nil
 }
 
-func (w *waitVideoBackend) NewPresenter() present.Presenter { return w.presWait }
+func (w *waitVideoBackend) NewPresenter(string) present.Presenter { return w.presWait }
+
+func TestPickEndpointDirectPCM(t *testing.T) {
+	names := []string{"HDA NVidia - HDMI 0 (hw:0,3)"}
+	for _, pcm := range []string{"default", "pipewire", "plughw:0,3"} {
+		got, err := pickEndpoint(names, pcm, "output", AudioALSA)
+		if err != nil || got != pcm {
+			t.Errorf("pickEndpoint(%q, AudioALSA) = (%q, %v)", pcm, got, err)
+		}
+	}
+	if _, err := pickEndpoint(names, "default", "output", AudioWASAPI); err == nil {
+		t.Errorf("pickEndpoint(default, AudioWASAPI) should reject unknown endpoint")
+	}
+}

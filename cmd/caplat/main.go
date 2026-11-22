@@ -18,6 +18,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -109,7 +110,11 @@ func list(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("\nCapture devices (DirectShow):")
+	devLabel := "DirectShow"
+	if runtime.GOOS != "windows" {
+		devLabel = "V4L2"
+	}
+	fmt.Printf("\nCapture devices (%s):\n", devLabel)
 	for _, dv := range devs {
 		fmt.Printf("  %q\n", dv)
 		modes, err := caplat.Modes(ctx, *ff, dv)
@@ -162,14 +167,23 @@ func firstLine(s string) string {
 func run(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var cfg caplat.Config
-	fs.StringVar(&cfg.Backend, "backend", caplat.BackendMF, "capture backend: mf (Media Foundation; also reports the driver's timestamp), dshow (DirectShow in-process) or ffmpeg (DirectShow through ffmpeg)")
-	fs.StringVar(&cfg.Display, "display", "auto", `output feeding the card: \\.\DISPLAY3, DISPLAY3 or auto`)
+	backendHelp := "capture backend: mf (Media Foundation; also reports the driver's timestamp), dshow (DirectShow in-process) or ffmpeg (DirectShow through ffmpeg)"
+	displayHelp := `output feeding the card: \\.\DISPLAY3, DISPLAY3 or auto`
+	ffInHelp := "extra ffmpeg options before -f dshow"
+	if runtime.GOOS != "windows" {
+		backendHelp = "capture backend: v4l2 (in-process; also reports the driver's timestamp) or ffmpeg (V4L2 through ffmpeg)"
+		displayHelp = "output feeding the card: HDMI-A-1, DP-2 or auto"
+		ffInHelp = "extra ffmpeg options before -f v4l2"
+	}
+	fs.StringVar(&cfg.Backend, "backend", caplat.DefaultBackend(), backendHelp)
+	fs.StringVar(&cfg.Presenter, "presenter", caplat.PresenterAuto, "barcode presenter: auto or wayland")
+	fs.StringVar(&cfg.Display, "display", "auto", displayHelp)
 	fs.StringVar(&cfg.Device, "device", "", "capture device (default: the one that looks like a capture card)")
 	size := fs.String("size", "1280x720", "capture size WxH")
 	fs.StringVar(&cfg.PixelFormat, "pixel-format", "auto", "capture format: auto, nv12, yuyv422, mjpeg, ... (mf: auto, NV12, YUY2, ...)")
 	fs.StringVar(&cfg.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering: low-latency or default")
 	fs.StringVar(&cfg.FFmpeg, "ffmpeg", "", "ffmpeg binary (default: ffmpeg on PATH)")
-	ffIn := fs.String("ffmpeg-in", "", "extra ffmpeg options before -f dshow")
+	ffIn := fs.String("ffmpeg-in", "", ffInHelp)
 	ffOut := fs.String("ffmpeg-out", "", "extra ffmpeg options after -i")
 	fs.DurationVar(&cfg.Duration, "duration", 30*time.Second, "how long to measure (0 = until Esc / Ctrl+C)")
 	fs.DurationVar(&cfg.Interval, "interval", time.Minute, "print statistics every interval")
@@ -262,16 +276,24 @@ func printResult(r caplat.Result) {
 		c.Captured, c.DecodeFail, c.OnlyVblank, c.OnlyCapture, c.Mismatched)
 	fmt.Printf("  output %s, capture %s\n", r.Setup.OutputMode, r.Setup.CaptureMode)
 	if d := r.Device; d.N > 0 {
-		fmt.Printf("\nsplit at the driver's capture timestamp (Media Foundation)\n")
+		driverName := "Media Foundation"
+		if r.Setup.Backend == caplat.BackendV4L2 {
+			driverName = "V4L2"
+		}
+		fmt.Printf("\nsplit at the driver's capture timestamp (%s)\n", driverName)
 		fmt.Printf("  vblank -> driver timestamp:  %s\n", caplat.FormatStats(d))
-		fmt.Printf("  driver timestamp -> caplat:  p50 %.1f ms (rest of the frame over USB, driver, Media Foundation)\n", r.Total.P50-d.P50)
+		fmt.Printf("  driver timestamp -> caplat:  p50 %.1f ms (rest of the frame over USB, driver, %s)\n", r.Total.P50-d.P50, driverName)
 	}
 }
 
 func runAudio(args []string) error {
 	fs := flag.NewFlagSet("audio", flag.ExitOnError)
 	var cfg caplat.AudioConfig
-	fs.StringVar(&cfg.Backend, "backend", caplat.AudioWASAPI, "capture backend: wasapi (in-process; also reports the driver's timestamp) or ffmpeg (DirectShow through ffmpeg)")
+	audioBackendHelp := "capture backend: wasapi (in-process; also reports the driver's timestamp) or ffmpeg (DirectShow through ffmpeg)"
+	if runtime.GOOS != "windows" {
+		audioBackendHelp = "capture backend: alsa (in-process via libasound; also reports the driver's timestamp) or ffmpeg (ALSA through ffmpeg)"
+	}
+	fs.StringVar(&cfg.Backend, "backend", caplat.DefaultAudioBackend(), audioBackendHelp)
 	fs.StringVar(&cfg.Output, "output", "", "audio output feeding the card, or part of its name (default: the one that looks like the card)")
 	fs.StringVar(&cfg.Input, "input", "", "the card's audio input, or part of its name (default: the one that looks like the card)")
 	fs.StringVar(&cfg.Preset, "preset", caplat.PresetLowLatency, "ffmpeg buffering: low-latency or default")
@@ -302,12 +324,15 @@ func runAudio(args []string) error {
 	fmt.Println("measuring audio: a 10 ms chirp every 500 ms... (Ctrl+C to stop)")
 	res, err := caplat.RunAudio(ctx, cfg)
 	fmt.Printf("output   %q (%s)\ninput    %q via %s\n", res.Output, res.OutputFormat, res.Input, res.Backend)
-	if res.Backend == caplat.AudioWASAPI {
+	if res.Backend == caplat.AudioWASAPI || res.Backend == caplat.AudioALSA {
 		p := "default (about 10 ms)"
 		if res.InputPeriod > 0 {
 			p = res.InputPeriod.String()
 		}
 		fmt.Printf("period   %s\n", p)
+	}
+	if res.SoftwareMixer {
+		fmt.Println("note     opened software mixer fallback (PipeWire/default) because hardware PCM was busy")
 	}
 	if len(res.FFmpegArgs) > 0 {
 		fmt.Printf("ffmpeg   %s\n", strings.Join(res.FFmpegArgs, " "))
@@ -326,8 +351,15 @@ func runSync(args []string) error {
 	fs := flag.NewFlagSet("sync", flag.ExitOnError)
 	var v caplat.Config
 	var a caplat.AudioConfig
-	fs.StringVar(&v.Backend, "backend", caplat.BackendMF, "video capture backend: mf, dshow or ffmpeg")
-	fs.StringVar(&a.Backend, "audio-backend", caplat.AudioWASAPI, "audio capture backend: wasapi or ffmpeg")
+	syncVideoHelp := "video capture backend: mf, dshow or ffmpeg"
+	syncAudioHelp := "audio capture backend: wasapi or ffmpeg"
+	if runtime.GOOS != "windows" {
+		syncVideoHelp = "video capture backend: v4l2 or ffmpeg"
+		syncAudioHelp = "audio capture backend: alsa or ffmpeg"
+	}
+	fs.StringVar(&v.Backend, "backend", caplat.DefaultBackend(), syncVideoHelp)
+	fs.StringVar(&v.Presenter, "presenter", caplat.PresenterAuto, "barcode presenter: auto or wayland")
+	fs.StringVar(&a.Backend, "audio-backend", caplat.DefaultAudioBackend(), syncAudioHelp)
 	fs.StringVar(&v.Display, "display", "auto", "output feeding the card")
 	fs.StringVar(&v.Device, "device", "", "video capture device")
 	size := fs.String("size", "1280x720", "capture size WxH")

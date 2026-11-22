@@ -38,6 +38,7 @@ type globalInfo struct {
 type wlOutputState struct {
 	globalName uint32
 	id         uint32
+	ver        uint32
 	x, y       int32
 	make       string
 	model      string
@@ -73,6 +74,7 @@ type Client struct {
 	fdQueue []int
 
 	globals         map[uint32]globalInfo
+	registryID      uint32
 	compositorID    uint32
 	compositorVer   uint32
 	shmID           uint32
@@ -105,8 +107,9 @@ type Client struct {
 	bufs                  []shmBuf
 	firstCommit           bool
 
-	callbacksDone map[uint32]bool
-	pendingFB     map[uint32]uint64 // wp_presentation_feedback ID -> frame number
+	pendingCallbacks map[uint32]bool
+	callbacksDone    map[uint32]bool
+	pendingFB        map[uint32]uint64 // wp_presentation_feedback ID -> frame number
 
 	aborted        bool
 	warnedZeroCopy bool
@@ -121,14 +124,15 @@ func NewClient(tr Transport, shm SHMAllocator, warn func(string)) *Client {
 		warn = func(msg string) { fmt.Fprintln(os.Stderr, msg) }
 	}
 	return &Client{
-		tr:            tr,
-		shm:           shm,
-		warn:          warn,
-		nextID:        2, // 1 is wl_display
-		globals:       make(map[uint32]globalInfo),
-		outputs:       make(map[uint32]*wlOutputState),
-		callbacksDone: make(map[uint32]bool),
-		pendingFB:     make(map[uint32]uint64),
+		tr:               tr,
+		shm:              shm,
+		warn:             warn,
+		nextID:           2, // 1 is wl_display
+		globals:          make(map[uint32]globalInfo),
+		outputs:          make(map[uint32]*wlOutputState),
+		pendingCallbacks: make(map[uint32]bool),
+		callbacksDone:    make(map[uint32]bool),
+		pendingFB:        make(map[uint32]uint64),
 	}
 }
 
@@ -155,24 +159,30 @@ func (c *Client) flush() error {
 
 func (c *Client) roundtrip() error {
 	cb := c.allocID()
+	c.pendingCallbacks[cb] = true
 	c.enc.Msg(wlDisplayID, wlDisplayReqSync, func(e *Encoder) {
 		e.Uint32(cb)
 	})
 	if err := c.flush(); err != nil {
+		delete(c.pendingCallbacks, cb)
 		return err
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for !c.callbacksDone[cb] {
 		if c.fatalErr != nil {
+			delete(c.pendingCallbacks, cb)
 			return c.fatalErr
 		}
 		if time.Now().After(deadline) {
+			delete(c.pendingCallbacks, cb)
 			return errors.New("wayland: compositor sync roundtrip timed out")
 		}
 		if err := c.dispatch(200); err != nil {
+			delete(c.pendingCallbacks, cb)
 			return err
 		}
 	}
+	delete(c.pendingCallbacks, cb)
 	delete(c.callbacksDone, cb)
 	return nil
 }
@@ -182,9 +192,9 @@ func (c *Client) roundtrip() error {
 func (c *Client) Open(d displays.Display, onVblank func(frame uint64, ns int64)) error {
 	c.onVblank = onVblank
 
-	regID := c.allocID()
+	c.registryID = c.allocID()
 	c.enc.Msg(wlDisplayID, wlDisplayReqGetRegistry, func(e *Encoder) {
-		e.Uint32(regID)
+		e.Uint32(c.registryID)
 	})
 	if err := c.roundtrip(); err != nil {
 		return err
@@ -223,19 +233,19 @@ func (c *Client) Open(d displays.Display, onVblank func(frame uint64, ns int64))
 	}
 
 	c.compositorVer = min(compName.version, 4)
-	c.compositorID = c.bindGlobal(regID, compName.name, "wl_compositor", c.compositorVer)
-	c.shmID = c.bindGlobal(regID, shmName.name, "wl_shm", 1)
+	c.compositorID = c.bindGlobal(c.registryID, compName.name, "wl_compositor", c.compositorVer)
+	c.shmID = c.bindGlobal(c.registryID, shmName.name, "wl_shm", 1)
 	c.xdgWmBaseVer = min(wmName.version, 2)
-	c.xdgWmBaseID = c.bindGlobal(regID, wmName.name, "xdg_wm_base", c.xdgWmBaseVer)
-	c.wpPresID = c.bindGlobal(regID, presName.name, "wp_presentation", 1)
+	c.xdgWmBaseID = c.bindGlobal(c.registryID, wmName.name, "xdg_wm_base", c.xdgWmBaseVer)
+	c.wpPresID = c.bindGlobal(c.registryID, presName.name, "wp_presentation", 1)
 	if seatName != nil {
 		c.seatVer = min(seatName.version, 5)
-		c.seatID = c.bindGlobal(regID, seatName.name, "wl_seat", c.seatVer)
+		c.seatID = c.bindGlobal(c.registryID, seatName.name, "wl_seat", c.seatVer)
 	}
 	for _, og := range outGlobals {
 		ver := min(og.version, 4)
-		oid := c.bindGlobal(regID, og.name, "wl_output", ver)
-		c.outputs[oid] = &wlOutputState{globalName: og.name, id: oid, scale: 1}
+		oid := c.bindGlobal(c.registryID, og.name, "wl_output", ver)
+		c.outputs[oid] = &wlOutputState{globalName: og.name, id: oid, ver: ver, scale: 1}
 	}
 
 	if err := c.roundtrip(); err != nil {
@@ -499,29 +509,36 @@ func (c *Client) Present(frame uint64, draw func(buf []byte, w, stride int)) err
 	})
 
 	frameCB := c.allocID()
+	c.pendingCallbacks[frameCB] = true
 	c.enc.Msg(c.surfaceID, wlSurfaceReqFrame, func(e *Encoder) {
 		e.Uint32(frameCB)
 	})
 	c.enc.Msg(c.surfaceID, wlSurfaceReqCommit, nil)
 	if err := c.flush(); err != nil {
+		delete(c.pendingCallbacks, frameCB)
 		return err
 	}
 
 	frameDeadline := time.Now().Add(2 * time.Second)
 	for !c.callbacksDone[frameCB] {
 		if c.aborted {
+			delete(c.pendingCallbacks, frameCB)
 			return ErrAborted
 		}
 		if c.fatalErr != nil {
+			delete(c.pendingCallbacks, frameCB)
 			return c.fatalErr
 		}
 		if time.Now().After(frameDeadline) {
+			delete(c.pendingCallbacks, frameCB)
 			return errors.New("wayland: wl_surface.frame callback timed out (is output unplugged or asleep?)")
 		}
 		if err := c.dispatch(100); err != nil {
+			delete(c.pendingCallbacks, frameCB)
 			return err
 		}
 	}
+	delete(c.pendingCallbacks, frameCB)
 	delete(c.callbacksDone, frameCB)
 	if c.fatalErr != nil {
 		return c.fatalErr
@@ -756,10 +773,11 @@ func (c *Client) handleEvent(objID uint32, opcode uint16, payload []byte) error 
 			}
 		}
 		return nil
-	}
 
-	// wl_registry (object 2 typically, check globals).
-	if objID == 2 {
+	case c.shmID, c.surfaceID:
+		return nil
+
+	case c.registryID:
 		switch opcode {
 		case wlRegistryEvGlobal:
 			name, err := dec.Uint32()
@@ -875,7 +893,7 @@ func (c *Client) handleEvent(objID uint32, opcode uint16, payload []byte) error 
 	}
 
 	// wl_callback.done
-	if opcode == wlCallbackEvDone {
+	if opcode == wlCallbackEvDone && c.pendingCallbacks[objID] {
 		c.callbacksDone[objID] = true
 		return nil
 	}
@@ -931,17 +949,19 @@ func (c *Client) Close() error {
 		if c.surfaceID != 0 {
 			c.enc.Msg(c.surfaceID, wlSurfaceReqDestroy, nil)
 		}
-		if c.pointerID != 0 {
+		if c.pointerID != 0 && c.seatVer >= 3 {
 			c.enc.Msg(c.pointerID, wlPointerReqRelease, nil)
 		}
-		if c.keyboardID != 0 {
+		if c.keyboardID != 0 && c.seatVer >= 3 {
 			c.enc.Msg(c.keyboardID, wlKeyboardReqRelease, nil)
 		}
 		if c.seatID != 0 && c.seatVer >= 5 {
 			c.enc.Msg(c.seatID, wlSeatReqRelease, nil)
 		}
-		for oid := range c.outputs {
-			c.enc.Msg(oid, wlOutputReqRelease, nil)
+		for oid, out := range c.outputs {
+			if out.ver >= 3 {
+				c.enc.Msg(oid, wlOutputReqRelease, nil)
+			}
 		}
 		if c.wpPresID != 0 {
 			c.enc.Msg(c.wpPresID, wpPresentationReqDestroy, nil)

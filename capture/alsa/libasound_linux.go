@@ -248,7 +248,8 @@ func (d *puregoDriver) Configure(h pcmHandle, cfg hwConfig, isPlayback bool) (ne
 	_ = d.lib.fnSWParamsSetTstampMode(p.pcm, sw, TstampEnable)
 	_ = d.lib.fnSWParamsSetTstampType(p.pcm, sw, TstampTypeMonotonic)
 	if isPlayback && bFrames > 0 {
-		_ = d.lib.fnSWParamsSetStartThreshold(p.pcm, sw, bFrames)
+		thresh := min(bFrames, max(pFrames*2, 1))
+		_ = d.lib.fnSWParamsSetStartThreshold(p.pcm, sw, thresh)
 	}
 	if rc := d.lib.fnSWParams(p.pcm, sw); rc < 0 {
 		return negotiatedHW{}, fmt.Errorf("snd_pcm_sw_params: %w", d.errStr(rc))

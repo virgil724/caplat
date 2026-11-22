@@ -5,13 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/virgil724/caplat/capture"
-	"github.com/virgil724/caplat/internal/audio"
+	"github.com/virgil724/caplat/capture/alsa"
 	"github.com/virgil724/caplat/displays"
+	"github.com/virgil724/caplat/internal/audio"
 	"github.com/virgil724/caplat/internal/measure"
 )
 
@@ -80,9 +82,19 @@ func AudioOutputs() ([]string, error) { return newAudioBackend().Outputs() }
 // AudioInputs lists the active audio capture endpoints.
 func AudioInputs() ([]string, error) { return newAudioBackend().Inputs() }
 
-func pickEndpoint(names []string, want, what string) (string, error) {
+func isLinuxAudioBackend(backend string) bool {
+	return backend == AudioALSA || (backend == AudioFFmpeg && runtime.GOOS == "linux")
+}
+
+func pickEndpoint(names []string, want, what, backend string) (string, error) {
 	if want != "" {
-		return audio.FindName(names, want)
+		if n, err := audio.FindName(names, want); err == nil {
+			return n, nil
+		} else if isLinuxAudioBackend(backend) && alsa.IsDirectPCM(want) {
+			return want, nil
+		} else {
+			return "", err
+		}
 	}
 	if n := displays.PickDevice(names); n != "" {
 		return n, nil
@@ -101,7 +113,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 
 func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioResult, error) {
 	if cfg.Backend == "" {
-		cfg.Backend = AudioWASAPI
+		cfg.Backend = DefaultAudioBackend()
 	}
 	if err := deps.ab.ValidateBackend(cfg.Backend); err != nil {
 		return AudioResult{}, err
@@ -110,18 +122,18 @@ func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioRe
 		cfg.Interval = 10 * time.Second
 	}
 	outs, err := deps.ab.Outputs()
-	if err != nil {
+	if err != nil && !(isLinuxAudioBackend(cfg.Backend) && alsa.IsDirectPCM(cfg.Output)) {
 		return AudioResult{}, err
 	}
-	out, err := pickEndpoint(outs, cfg.Output, "output (--output)")
+	out, err := pickEndpoint(outs, cfg.Output, "output (--output)", cfg.Backend)
 	if err != nil {
 		return AudioResult{}, err
 	}
 	ins, err := deps.ab.Inputs()
-	if err != nil {
+	if err != nil && !(isLinuxAudioBackend(cfg.Backend) && alsa.IsDirectPCM(cfg.Input)) {
 		return AudioResult{}, err
 	}
-	in, err := pickEndpoint(ins, cfg.Input, "input (--input)")
+	in, err := pickEndpoint(ins, cfg.Input, "input (--input)", cfg.Backend)
 	if err != nil {
 		return AudioResult{}, err
 	}
@@ -184,6 +196,9 @@ func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioRe
 		return res, err
 	}
 	defer src.Stop()
+	if sw, ok := src.(interface{ UsingSoftwareMixer() bool }); ok && sw.UsingSoftwareMixer() {
+		res.SoftwareMixer = true
+	}
 	// The rate is known once the capture runs; publishing the detector
 	// starts detection on the capture thread.
 	rate = int64(src.Rate())
@@ -204,6 +219,9 @@ func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioRe
 		return res, err
 	}
 	defer pl.Stop()
+	if sw, ok := pl.(interface{ UsingSoftwareMixer() bool }); ok && sw.UsingSoftwareMixer() {
+		res.SoftwareMixer = true
+	}
 	res.OutputFormat = fmt.Sprintf("%d Hz", outRate)
 
 	// Pair detections with the chirp played last before them.

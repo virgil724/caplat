@@ -38,6 +38,18 @@ const (
 	PresetDefault    = "default"
 )
 
+// Barcode presenters.
+const (
+	PresenterAuto    = "auto"
+	PresenterWayland = "wayland"
+)
+
+// DefaultBackend returns the default video capture backend for the current OS.
+func DefaultBackend() string { return defaultBackend() }
+
+// DefaultAudioBackend returns the default audio backend for the current OS.
+func DefaultAudioBackend() string { return defaultAudioBackend() }
+
 // Capture backends.
 const (
 	// BackendFFmpeg reads the card through an ffmpeg subprocess and
@@ -59,8 +71,9 @@ var ErrPrimary = errors.New("the chosen display is the primary display; the full
 
 // Config describes a measurement.
 type Config struct {
-	Backend       string // BackendMF (default), BackendDShow or BackendFFmpeg
-	Display       string // \\.\DISPLAYn, DISPLAYn, or "auto"
+	Backend       string // DefaultBackend() when empty
+	Presenter     string // PresenterAuto (default) or PresenterWayland on Linux
+	Display       string // \\.\DISPLAYn, DISPLAYn, HDMI-A-1, or "auto"
 	Device        string // capture device; "" = the capture card, if it is clear which
 	CaptureWidth  int    // default 1280
 	CaptureHeight int    // default 720
@@ -87,7 +100,10 @@ func (c *Config) defaults() {
 		c.Preset = PresetLowLatency
 	}
 	if c.Backend == "" {
-		c.Backend = BackendMF
+		c.Backend = DefaultBackend()
+	}
+	if c.Presenter == "" {
+		c.Presenter = PresenterAuto
 	}
 	if c.Interval <= 0 {
 		c.Interval = time.Minute

@@ -52,12 +52,16 @@ func StartALSA(endpoint string, period time.Duration, exclusive bool, now func()
 // ALSAPlayer plays chirps over ALSA and reports each chirp's departure timestamp
 // on CLOCK_MONOTONIC via snd_pcm_status htstamp + delay.
 type ALSAPlayer struct {
-	Rate int
+	Rate    int
+	swMixer bool
 
 	done     chan error
 	stop     chan struct{}
 	stopOnce sync.Once
 }
+
+// UsingSoftwareMixer reports whether playback fell back to a software mixer.
+func (p *ALSAPlayer) UsingSoftwareMixer() bool { return p.swMixer }
 
 // Done delivers why playback ended.
 func (p *ALSAPlayer) Done() <-chan error { return p.done }
@@ -106,6 +110,7 @@ func (p *ALSAPlayer) run(cfg PlayerConfig, freq int64, onEmit func(Emitted), rea
 	defer pb.Close()
 
 	if pb.SoftwareMixer {
+		p.swMixer = true
 		fmt.Fprintf(os.Stderr, "caplat: ALSA output %q was busy; fell back to software mixer %q\n", cfg.Endpoint, pb.ActualDevice)
 	}
 
@@ -174,7 +179,10 @@ func (p *ALSAPlayer) run(cfg PlayerConfig, freq int64, onEmit func(Emitted), rea
 	}
 
 	// Prime the buffer before start_threshold triggers playback.
-	prime := max(pb.BufferFrames, chunkFrames)
+	prime := chunkFrames
+	if pb.BufferFrames > 0 {
+		prime = min(pb.BufferFrames, max(pb.PeriodFrames*2, chunkFrames))
+	}
 	if err := fillAndWrite(prime); err != nil {
 		return err
 	}

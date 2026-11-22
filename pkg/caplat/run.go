@@ -25,11 +25,13 @@ type videoBackend interface {
 	Devices(ctx context.Context, ffmpegBin string) ([]string, error)
 	DevicesMF() ([]string, error)
 	DevicesDShow() ([]string, error)
+	DevicesV4L2() ([]string, error)
 	Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error)
 	ValidateBackend(backend string) error
+	ValidatePresenter(presenter string) error
 	ListCaptureDevices(ctx context.Context, cfg Config) ([]string, error)
 	PrepareCapture(ctx context.Context, cfg Config, d Display, device string) (Setup, captureStarter, error)
-	NewPresenter() present.Presenter
+	NewPresenter(presenter string) present.Presenter
 }
 
 type unsupportedVideoBackend struct{}
@@ -40,17 +42,19 @@ func (unsupportedVideoBackend) Devices(context.Context, string) ([]string, error
 }
 func (unsupportedVideoBackend) DevicesMF() ([]string, error)    { return nil, ErrUnsupported }
 func (unsupportedVideoBackend) DevicesDShow() ([]string, error) { return nil, ErrUnsupported }
+func (unsupportedVideoBackend) DevicesV4L2() ([]string, error)  { return nil, ErrUnsupported }
 func (unsupportedVideoBackend) Modes(context.Context, string, string) ([]Mode, error) {
 	return nil, ErrUnsupported
 }
-func (unsupportedVideoBackend) ValidateBackend(string) error { return ErrUnsupported }
+func (unsupportedVideoBackend) ValidateBackend(string) error   { return ErrUnsupported }
+func (unsupportedVideoBackend) ValidatePresenter(string) error { return ErrUnsupported }
 func (unsupportedVideoBackend) ListCaptureDevices(context.Context, Config) ([]string, error) {
 	return nil, ErrUnsupported
 }
 func (unsupportedVideoBackend) PrepareCapture(context.Context, Config, Display, string) (Setup, captureStarter, error) {
 	return Setup{}, nil, ErrUnsupported
 }
-func (unsupportedVideoBackend) NewPresenter() present.Presenter { return nil }
+func (unsupportedVideoBackend) NewPresenter(string) present.Presenter { return nil }
 
 type runDeps struct {
 	vb         videoBackend
@@ -88,6 +92,9 @@ func PickDevice(devices []string) string { return displays.PickDevice(devices) }
 // ffmpeg needed).
 func DevicesDShow() ([]string, error) { return newVideoBackend().DevicesDShow() }
 
+// DevicesV4L2 lists V4L2 video capture devices on Linux.
+func DevicesV4L2() ([]string, error) { return newVideoBackend().DevicesV4L2() }
+
 // Modes lists a device's capture modes.
 func Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error) {
 	return newVideoBackend().Modes(ctx, ffmpegBin, device)
@@ -104,6 +111,9 @@ type resolved struct {
 func resolve(ctx context.Context, cfg *Config, vb videoBackend) (resolved, error) {
 	cfg.defaults()
 	if err := vb.ValidateBackend(cfg.Backend); err != nil {
+		return resolved{}, err
+	}
+	if err := vb.ValidatePresenter(cfg.Presenter); err != nil {
 		return resolved{}, err
 	}
 	list, err := vb.Displays()
@@ -231,7 +241,7 @@ func runWith(ctx context.Context, cfg Config, updates chan<- Update, deps runDep
 	pcfg.OnStart = func() { started <- time.Now() }
 
 	presErr := make(chan error, 1)
-	go func() { presErr <- present.Run(runCtx, pcfg, deps.vb.NewPresenter()) }()
+	go func() { presErr <- present.Run(runCtx, pcfg, deps.vb.NewPresenter(cfg.Presenter)) }()
 
 	// Wait for measuring to start (or an early failure).
 	var t0 time.Time
