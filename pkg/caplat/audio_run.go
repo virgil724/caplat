@@ -1,5 +1,3 @@
-//go:build windows
-
 package caplat
 
 import (
@@ -11,10 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/virgil724/caplat/capture"
 	"github.com/virgil724/caplat/internal/audio"
 	"github.com/virgil724/caplat/internal/displays"
 	"github.com/virgil724/caplat/internal/measure"
-	"github.com/virgil724/caplat/internal/win"
 )
 
 // The test signal.
@@ -29,9 +27,58 @@ const (
 	chirpJitter = 0.02
 )
 
-// AudioOutputs and AudioInputs list the active audio endpoints.
-func AudioOutputs() ([]string, error) { return audio.Endpoints(false) }
-func AudioInputs() ([]string, error)  { return audio.Endpoints(true) }
+type audioSource interface {
+	Done() <-chan error
+	Stop()
+	Rate() int
+}
+
+type audioPlayer interface {
+	Done() <-chan error
+	Stop()
+}
+
+type audioBackend interface {
+	ValidateBackend(backend string) error
+	Outputs() ([]string, error)
+	Inputs() ([]string, error)
+	StartCapture(ctx context.Context, cfg AudioConfig, input string, now func() int64, freq int64, onSamples audio.OnSamples) (audioSource, time.Duration, []string, error)
+	StartPlayer(cfg audio.PlayerConfig, freq int64, onEmit func(audio.Emitted)) (audioPlayer, int, error)
+}
+
+type unsupportedAudioBackend struct{}
+
+func (unsupportedAudioBackend) ValidateBackend(string) error    { return ErrUnsupported }
+func (unsupportedAudioBackend) Outputs() ([]string, error)      { return nil, ErrUnsupported }
+func (unsupportedAudioBackend) Inputs() ([]string, error)       { return nil, ErrUnsupported }
+func (unsupportedAudioBackend) StartCapture(context.Context, AudioConfig, string, func() int64, int64, audio.OnSamples) (audioSource, time.Duration, []string, error) {
+	return nil, 0, nil, ErrUnsupported
+}
+func (unsupportedAudioBackend) StartPlayer(audio.PlayerConfig, int64, func(audio.Emitted)) (audioPlayer, int, error) {
+	return nil, 0, ErrUnsupported
+}
+
+type audioDeps struct {
+	ab         audioBackend
+	now        func() int64
+	freq       int64
+	drainDelay time.Duration
+}
+
+func defaultAudioDeps() audioDeps {
+	return audioDeps{
+		ab:         newAudioBackend(),
+		now:        capture.Now,
+		freq:       capture.ClockFreq(),
+		drainDelay: 600 * time.Millisecond,
+	}
+}
+
+// AudioOutputs lists the active audio render endpoints.
+func AudioOutputs() ([]string, error) { return newAudioBackend().Outputs() }
+
+// AudioInputs lists the active audio capture endpoints.
+func AudioInputs() ([]string, error) { return newAudioBackend().Inputs() }
 
 func pickEndpoint(names []string, want, what string) (string, error) {
 	if want != "" {
@@ -43,28 +90,26 @@ func pickEndpoint(names []string, want, what string) (string, error) {
 	return "", fmt.Errorf("choose the audio %s; found %q", what, names)
 }
 
-type audioSource interface {
-	Done() <-chan error
-	Stop()
-	Rate() int
-}
-
 type detection struct {
-	dev, arr int64 // QPC ticks; dev 0 if unknown
+	dev, arr int64 // platform monotonic ticks; dev 0 if unknown
 }
 
 // RunAudio measures until cfg.Duration passes or ctx ends.
 func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
+	return runAudioWith(ctx, cfg, defaultAudioDeps())
+}
+
+func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioResult, error) {
 	if cfg.Backend == "" {
 		cfg.Backend = AudioWASAPI
 	}
-	if cfg.Backend != AudioWASAPI && cfg.Backend != AudioFFmpeg {
-		return AudioResult{}, fmt.Errorf("unknown audio backend %q (want %s or %s)", cfg.Backend, AudioWASAPI, AudioFFmpeg)
+	if err := deps.ab.ValidateBackend(cfg.Backend); err != nil {
+		return AudioResult{}, err
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
-	outs, err := AudioOutputs()
+	outs, err := deps.ab.Outputs()
 	if err != nil {
 		return AudioResult{}, err
 	}
@@ -72,7 +117,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	if err != nil {
 		return AudioResult{}, err
 	}
-	ins, err := AudioInputs()
+	ins, err := deps.ab.Inputs()
 	if err != nil {
 		return AudioResult{}, err
 	}
@@ -81,7 +126,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		return AudioResult{}, err
 	}
 	res := AudioResult{Output: out, Input: in, Backend: cfg.Backend}
-	freq := win.QPCFrequency()
+	freq := deps.freq
 	toMS := func(ticks int64) float64 { return float64(ticks) * 1000 / float64(freq) }
 
 	var (
@@ -128,31 +173,15 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		}
 	}
 
-	var src audioSource
-	switch cfg.Backend {
-	case AudioWASAPI:
-		c, err := audio.StartWASAPI(in, cfg.Period, cfg.Exclusive, win.QPC, freq, func(x []float64, p audio.Packet) {
-			if det.Load() != nil {
-				onSamples(x, p)
-			}
-		})
-		if err != nil {
-			return res, err
+	src, period, ffArgs, err := deps.ab.StartCapture(ctx, cfg, in, deps.now, freq, func(x []float64, p audio.Packet) {
+		if det.Load() != nil {
+			onSamples(x, p)
 		}
-		res.InputPeriod = c.Period
-		src = c
-	case AudioFFmpeg:
-		fc := audio.FFmpegConfig{FFmpeg: cfg.FFmpeg, Device: in, LowLatency: cfg.Preset != PresetDefault}
-		res.FFmpegArgs = audio.FFmpegArgs(fc)
-		c, err := audio.StartFFmpeg(ctx, fc, win.QPC, func(x []float64, p audio.Packet) {
-			if det.Load() != nil {
-				onSamples(x, p)
-			}
-		})
-		if err != nil {
-			return res, err
-		}
-		src = c
+	})
+	res.InputPeriod = period
+	res.FFmpegArgs = ffArgs
+	if err != nil {
+		return res, err
 	}
 	defer src.Stop()
 	// The rate is known once the capture runs; publishing the detector
@@ -162,7 +191,7 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 	d.OnHit = onHit
 	det.Store(d)
 
-	pl, err := audio.StartPlayer(audio.PlayerConfig{
+	pl, outRate, err := deps.ab.StartPlayer(audio.PlayerConfig{
 		Endpoint: out, Period: chirpPeriod, First: chirpFirst, Level: chirpLevel, Jitter: chirpJitter,
 		Chirp: func(rate int) []float64 { return audio.Chirp(rate, rate*chirpMS/1000, chirpF0, chirpF1) },
 	}, freq, func(e audio.Emitted) {
@@ -175,12 +204,12 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		return res, err
 	}
 	defer pl.Stop()
-	res.OutputFormat = fmt.Sprintf("%d Hz", pl.Rate)
+	res.OutputFormat = fmt.Sprintf("%d Hz", outRate)
 
 	// Pair detections with the chirp played last before them.
 	maxLag := int64(0.45 * float64(freq))
 	match := func(final bool) {
-		cutoff := win.QPC() - int64(0.3*float64(freq))
+		cutoff := deps.now() - int64(0.3*float64(freq))
 		mu.Lock()
 		defer mu.Unlock()
 		k := 0
@@ -223,10 +252,10 @@ func RunAudio(ctx context.Context, cfg AudioConfig) (AudioResult, error) {
 		}
 		dets = dets[:k]
 		// Forget chirps too old to be matched.
-		now := win.QPC()
+		nowTick := deps.now()
 		j := 0
 		for _, e := range emitted {
-			if now-e.QPC < 2*maxLag {
+			if nowTick-e.QPC < 2*maxLag {
 				emitted[j] = e
 				j++
 			}
@@ -285,12 +314,17 @@ loop:
 		}
 	}
 	pl.Stop()
-	time.Sleep(600 * time.Millisecond) // let the last chirps arrive
+	if deps.drainDelay > 0 {
+		time.Sleep(deps.drainDelay) // let the last chirps arrive
+	}
 	src.Stop()
 	match(true)
 	res.Elapsed = time.Since(t0)
+	mu.Lock()
 	res.Delivered, res.Device = delTot.Stats(), devTot.Stats()
-	if res.Matched == 0 && runErr == nil {
+	matched := res.Matched
+	mu.Unlock()
+	if matched == 0 && runErr == nil {
 		runErr = errors.New("no chirp came back: is the output's audio reaching the card, and the right input chosen?")
 	}
 	return res, runErr

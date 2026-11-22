@@ -15,10 +15,12 @@ type Frame struct {
 	Pitch         int
 	FourCC        string // e.g. "NV12", "YUY2"
 	Width, Height int
-	// QPC is when the whole frame reached caplat.
+	// QPC is when the whole frame reached caplat, in platform monotonic ticks
+	// (QPC on Windows, CLOCK_MONOTONIC ns on Linux).
 	QPC int64
-	// DeviceQPC is the driver's capture timestamp converted to QPC ticks,
-	// or 0 when the backend does not have one (ffmpeg).
+	// DeviceQPC is the driver's capture timestamp converted to platform
+	// monotonic ticks (QPC on Windows, CLOCK_MONOTONIC ns on Linux), or 0
+	// when the backend does not have one (ffmpeg).
 	DeviceQPC int64
 }
 

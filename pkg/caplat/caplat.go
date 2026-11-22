@@ -10,7 +10,10 @@ import (
 	"io"
 	"time"
 
+	"github.com/virgil724/caplat/internal/capture/ffmpeg"
+	"github.com/virgil724/caplat/internal/displays"
 	"github.com/virgil724/caplat/internal/measure"
+	"github.com/virgil724/caplat/internal/present"
 )
 
 // Stats, Counts and Histogram are re-exported for callers.
@@ -18,7 +21,16 @@ type (
 	Stats     = measure.Stats
 	Counts    = measure.Counts
 	Histogram = measure.Histogram
+	Display   = displays.Display
+	Mode      = ffmpeg.Mode
 )
+
+// ErrUnsupported is returned on platforms without a backend yet.
+var ErrUnsupported = errors.New("caplat is not supported on this OS yet")
+
+// ErrAborted is returned when the user pressed Esc or clicked the
+// measurement window. The result so far is still returned.
+var ErrAborted = present.ErrAborted
 
 // Presets for the ffmpeg capture backend.
 const (

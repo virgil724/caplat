@@ -1,5 +1,3 @@
-//go:build windows
-
 package caplat
 
 import (
@@ -8,91 +6,107 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/virgil724/caplat/capture"
-	"github.com/virgil724/caplat/capture/mf"
 	"github.com/virgil724/caplat/internal/barcode"
-	"github.com/virgil724/caplat/internal/capture/dshow"
-	"github.com/virgil724/caplat/internal/capture/ffmpeg"
 	"github.com/virgil724/caplat/internal/displays"
 	"github.com/virgil724/caplat/internal/measure"
 	"github.com/virgil724/caplat/internal/present"
-	"github.com/virgil724/caplat/internal/win"
 )
 
-// Display is one desktop output; Mode is one capture mode of a device.
-type (
-	Display = displays.Display
-	Mode    = ffmpeg.Mode
-)
-
-// ErrAborted is returned when the user pressed Esc or clicked the
-// measurement window. The result so far is still returned.
-var ErrAborted = present.ErrAborted
-
-// Displays lists the desktop's outputs.
-func Displays() ([]Display, error) {
-	win.SetDPIAware()
-	return displays.List()
+type captureStarter interface {
+	Start(ctx context.Context, now func() int64, freq int64, onFrame func(capture.Frame)) (capture.Source, string, error)
 }
 
-// Devices lists DirectShow video capture devices (through ffmpeg).
+type videoBackend interface {
+	Displays() ([]Display, error)
+	Devices(ctx context.Context, ffmpegBin string) ([]string, error)
+	DevicesMF() ([]string, error)
+	DevicesDShow() ([]string, error)
+	Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error)
+	ValidateBackend(backend string) error
+	ListCaptureDevices(ctx context.Context, cfg Config) ([]string, error)
+	PrepareCapture(ctx context.Context, cfg Config, d Display, device string) (Setup, captureStarter, error)
+	NewPresenter() present.Presenter
+}
+
+type unsupportedVideoBackend struct{}
+
+func (unsupportedVideoBackend) Displays() ([]Display, error)                   { return nil, ErrUnsupported }
+func (unsupportedVideoBackend) Devices(context.Context, string) ([]string, error) {
+	return nil, ErrUnsupported
+}
+func (unsupportedVideoBackend) DevicesMF() ([]string, error)    { return nil, ErrUnsupported }
+func (unsupportedVideoBackend) DevicesDShow() ([]string, error) { return nil, ErrUnsupported }
+func (unsupportedVideoBackend) Modes(context.Context, string, string) ([]Mode, error) {
+	return nil, ErrUnsupported
+}
+func (unsupportedVideoBackend) ValidateBackend(string) error { return ErrUnsupported }
+func (unsupportedVideoBackend) ListCaptureDevices(context.Context, Config) ([]string, error) {
+	return nil, ErrUnsupported
+}
+func (unsupportedVideoBackend) PrepareCapture(context.Context, Config, Display, string) (Setup, captureStarter, error) {
+	return Setup{}, nil, ErrUnsupported
+}
+func (unsupportedVideoBackend) NewPresenter() present.Presenter { return nil }
+
+type runDeps struct {
+	vb         videoBackend
+	now        func() int64
+	freq       int64
+	drainDelay time.Duration
+}
+
+func defaultRunDeps() runDeps {
+	return runDeps{
+		vb:         newVideoBackend(),
+		now:        capture.Now,
+		freq:       capture.ClockFreq(),
+		drainDelay: 1500 * time.Millisecond,
+	}
+}
+
+// Displays lists the desktop's outputs.
+func Displays() ([]Display, error) { return newVideoBackend().Displays() }
+
+// Devices lists video capture devices (through ffmpeg).
 func Devices(ctx context.Context, ffmpegBin string) ([]string, error) {
-	return ffmpeg.ListDevices(ctx, ffmpegBin)
+	return newVideoBackend().Devices(ctx, ffmpegBin)
 }
 
 // DevicesMF lists video capture devices through Media Foundation (no
 // ffmpeg needed).
-func DevicesMF() ([]string, error) { return mf.ListDevices() }
+func DevicesMF() ([]string, error) { return newVideoBackend().DevicesMF() }
 
-// PickDevice chooses the capture card among DirectShow devices ("" if
-// that is ambiguous).
+// PickDevice chooses the capture card among capture devices ("" if that is
+// ambiguous).
 func PickDevice(devices []string) string { return displays.PickDevice(devices) }
 
 // DevicesDShow lists DirectShow video capture devices in-process (no
 // ffmpeg needed).
-func DevicesDShow() ([]string, error) { return dshow.ListDevices() }
-
-func apiName(backend string) string {
-	if backend == BackendDShow {
-		return "DirectShow"
-	}
-	return "Media Foundation"
-}
+func DevicesDShow() ([]string, error) { return newVideoBackend().DevicesDShow() }
 
 // Modes lists a device's capture modes.
 func Modes(ctx context.Context, ffmpegBin, device string) ([]Mode, error) {
-	return ffmpeg.ListModes(ctx, ffmpegBin, device)
+	return newVideoBackend().Modes(ctx, ffmpegBin, device)
 }
 
 type resolved struct {
 	setup   Setup
 	display displays.Display
-	ff      ffmpeg.Config
-	mf      mf.Config // also used for dshow
 	capW    int
 	capH    int
+	starter captureStarter
 }
 
-func listDevices(ctx context.Context, cfg *Config) ([]string, error) {
-	switch cfg.Backend {
-	case BackendMF:
-		return mf.ListDevices()
-	case BackendDShow:
-		return dshow.ListDevices()
-	}
-	return ffmpeg.ListDevices(ctx, cfg.FFmpeg)
-}
-
-func resolve(ctx context.Context, cfg *Config) (resolved, error) {
+func resolve(ctx context.Context, cfg *Config, vb videoBackend) (resolved, error) {
 	cfg.defaults()
-	if cfg.Backend != BackendFFmpeg && cfg.Backend != BackendMF && cfg.Backend != BackendDShow {
-		return resolved{}, fmt.Errorf("unknown backend %q (want %s, %s or %s)", cfg.Backend, BackendMF, BackendDShow, BackendFFmpeg)
+	if err := vb.ValidateBackend(cfg.Backend); err != nil {
+		return resolved{}, err
 	}
-	list, err := Displays()
+	list, err := vb.Displays()
 	if err != nil {
 		return resolved{}, err
 	}
@@ -105,7 +119,7 @@ func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 	}
 	dev := cfg.Device
 	if dev == "" {
-		devs, err := listDevices(ctx, cfg)
+		devs, err := vb.ListCaptureDevices(ctx, *cfg)
 		if err != nil {
 			return resolved{}, err
 		}
@@ -113,38 +127,27 @@ func resolve(ctx context.Context, cfg *Config) (resolved, error) {
 			return resolved{}, fmt.Errorf("choose a capture device with --device; found %q", devs)
 		}
 	}
-	r := resolved{display: d, capW: cfg.CaptureWidth, capH: cfg.CaptureHeight}
-	r.setup = Setup{Display: d.Name, DisplayName: d.FriendlyName, OutputMode: d.Mode(), Device: dev, Backend: cfg.Backend}
-
-	if cfg.Backend == BackendMF || cfg.Backend == BackendDShow {
-		r.mf = mf.Config{Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight, FPS: d.RefreshHz(), Format: cfg.PixelFormat}
-		r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s (%s)", cfg.CaptureWidth, cfg.CaptureHeight, d.FrameRate(), cfg.PixelFormat, apiName(cfg.Backend))
-		return r, nil
-	}
-	pf := cfg.PixelFormat
-	if strings.EqualFold(pf, "auto") {
-		modes, err := ffmpeg.ListModes(ctx, cfg.FFmpeg, dev)
-		if err != nil {
-			return resolved{}, err
-		}
-		if pf, err = ffmpeg.PickFormat(modes, cfg.CaptureWidth, cfg.CaptureHeight, d.RefreshHz()); err != nil {
-			return resolved{}, fmt.Errorf("%s: %w", dev, err)
-		}
-	}
-	r.ff = ffmpeg.Config{FFmpeg: cfg.FFmpeg, Device: dev, Width: cfg.CaptureWidth, Height: cfg.CaptureHeight,
-		FrameRate: d.FrameRate(), PixelFormat: pf, Preset: cfg.Preset, ExtraIn: cfg.FFmpegIn, ExtraOut: cfg.FFmpegOut}
-	args, err := ffmpeg.Args(r.ff)
+	setup, starter, err := vb.PrepareCapture(ctx, *cfg, d, dev)
 	if err != nil {
 		return resolved{}, err
 	}
-	r.setup.CaptureMode = fmt.Sprintf("%dx%d@%s %s", r.ff.Width, r.ff.Height, r.ff.FrameRate, pf)
-	r.setup.Preset, r.setup.FFmpegArgs = cfg.Preset, args
-	return r, nil
+	setup.Display = d.Name
+	setup.DisplayName = d.FriendlyName
+	setup.OutputMode = d.Mode()
+	setup.Device = dev
+	setup.Backend = cfg.Backend
+	return resolved{
+		setup:   setup,
+		display: d,
+		capW:    cfg.CaptureWidth,
+		capH:    cfg.CaptureHeight,
+		starter: starter,
+	}, nil
 }
 
 // Prepare resolves the display, device and capture mode without measuring.
 func Prepare(ctx context.Context, cfg Config) (Setup, error) {
-	r, err := resolve(ctx, &cfg)
+	r, err := resolve(ctx, &cfg, newVideoBackend())
 	return r.setup, err
 }
 
@@ -152,12 +155,16 @@ func Prepare(ctx context.Context, cfg Config) (Setup, error) {
 // updates (optional) receives an Update about once a second; sends never
 // block, so give it a buffer. The result is returned even on ErrAborted.
 func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error) {
-	r, err := resolve(ctx, &cfg)
+	return runWith(ctx, cfg, updates, defaultRunDeps())
+}
+
+func runWith(ctx context.Context, cfg Config, updates chan<- Update, deps runDeps) (Result, error) {
+	r, err := resolve(ctx, &cfg, deps.vb)
 	if err != nil {
 		return Result{}, err
 	}
 	res := Result{Setup: r.setup}
-	freq := win.QPCFrequency()
+	freq := deps.freq
 	geo := barcode.Geometry{OutW: r.display.Width, OutH: r.display.Height, CapW: r.capW, CapH: r.capH}
 
 	var (
@@ -199,29 +206,12 @@ func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error)
 		code, ok := geo.Decode(f.Y, f.Stride)
 		m.Captured(code, ok, f.QPC, f.DeviceQPC)
 	}
-	var src capture.Source
-	switch cfg.Backend {
-	case BackendDShow:
-		c := r.mf
-		s, err := dshow.Start(dshow.Config{Device: c.Device, Width: c.Width, Height: c.Height, FPS: c.FPS, Format: c.Format}, win.QPC, onFrame)
-		if err != nil {
-			return res, err
-		}
-		res.Setup.CaptureMode = fmt.Sprintf("%dx%d@%.3f %s (DirectShow)", s.Mode.Width, s.Mode.Height, s.Mode.FPS, s.Mode.FourCC)
-		src = s
-	case BackendMF:
-		s, err := mf.Start(r.mf, win.QPC, freq, onFrame)
-		if err != nil {
-			return res, err
-		}
-		res.Setup.CaptureMode = fmt.Sprintf("%dx%d@%.3f %s (Media Foundation)", s.Mode.Width, s.Mode.Height, s.Mode.FPS, s.Mode.FourCC)
-		src = s
-	default:
-		s, err := ffmpeg.Start(runCtx, r.ff, win.QPC, onFrame)
-		if err != nil {
-			return res, err
-		}
-		src = s
+	src, mode, err := r.starter.Start(runCtx, deps.now, freq, onFrame)
+	if err != nil {
+		return res, err
+	}
+	if mode != "" {
+		res.Setup.CaptureMode = mode
 	}
 	defer src.Stop()
 
@@ -241,7 +231,7 @@ func Run(ctx context.Context, cfg Config, updates chan<- Update) (Result, error)
 	pcfg.OnStart = func() { started <- time.Now() }
 
 	presErr := make(chan error, 1)
-	go func() { presErr <- present.Run(runCtx, pcfg) }()
+	go func() { presErr <- present.Run(runCtx, pcfg, deps.vb.NewPresenter()) }()
 
 	// Wait for measuring to start (or an early failure).
 	var t0 time.Time
@@ -297,8 +287,8 @@ loop:
 
 	// Let the last frames arrive, then stop the capture.
 	m.PresenterStopped()
-	if !errors.Is(runErr, present.ErrAborted) {
-		time.Sleep(1500 * time.Millisecond)
+	if !errors.Is(runErr, present.ErrAborted) && deps.drainDelay > 0 {
+		time.Sleep(deps.drainDelay)
 	}
 	cancel()
 	src.Stop()

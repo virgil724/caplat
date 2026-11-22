@@ -25,9 +25,6 @@ func Endpoints(capture bool) ([]string, error) {
 	return wasapi.Outputs()
 }
 
-// FindName returns the one name equal to want, or else containing it.
-func FindName(names []string, want string) (string, error) { return wasapi.FindName(names, want) }
-
 // worker is a goroutine on a locked COM thread that runs until stopped.
 type worker struct {
 	done     chan error
@@ -63,25 +60,6 @@ func (w *worker) start(run func(ready chan<- error) error) error {
 		w.done <- err
 	}()
 	return <-ready
-}
-
-// Emitted is one chirp as it left the output: its first sample's QPC time.
-type Emitted struct {
-	N   int   // chirp number, from 0
-	QPC int64 // when its first sample was played, in QPC ticks
-}
-
-// PlayerConfig describes the test signal.
-type PlayerConfig struct {
-	Endpoint string
-	Chirp    func(rate int) []float64 // the chirp at the endpoint's rate
-	Period   float64                  // seconds between chirps
-	First    float64                  // seconds before the first chirp
-	Level    float64                  // peak amplitude, 0..1
-	// Jitter adds a random 0..Jitter seconds to each period, so chirps
-	// fall at every phase of the capture's packet period instead of
-	// always the same one.
-	Jitter float64
 }
 
 // Player plays chirps in shared mode and reports when each was played,

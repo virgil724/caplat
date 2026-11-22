@@ -1,5 +1,3 @@
-//go:build windows
-
 package displays
 
 import "testing"
@@ -14,5 +12,8 @@ func TestPickDevice(t *testing.T) {
 	}
 	if got := PickDevice([]string{"Cam A", "Cam B"}); got != "" {
 		t.Errorf("ambiguous: got %q", got)
+	}
+	if got := PickDevice([]string{"Elgato Cam Link", "AVT GC553"}); got != "" {
+		t.Errorf("multiple cards: got %q", got)
 	}
 }
