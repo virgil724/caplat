@@ -10,7 +10,9 @@ const (
 	// AudioWASAPI reads the card's audio in-process with WASAPI, which also
 	// gives the driver's capture time of every packet.
 	AudioWASAPI = "wasapi"
-	// AudioFFmpeg reads it through an ffmpeg subprocess and DirectShow.
+	// AudioALSA reads and plays audio on Linux in-process with ALSA via purego.
+	AudioALSA = "alsa"
+	// AudioFFmpeg reads it through an ffmpeg subprocess and DirectShow/ALSA.
 	AudioFFmpeg = "ffmpeg"
 )
 
@@ -61,7 +63,8 @@ type AudioInterval struct {
 type AudioResult struct {
 	Output, Input, Backend string
 	OutputFormat           string
-	InputPeriod            time.Duration // WASAPI engine period used; 0 = default (about 10 ms)
+	InputPeriod            time.Duration // WASAPI/ALSA engine period used; 0 = default (about 10 ms)
+	SoftwareMixer          bool          // ALSA fell back to PipeWire/default mixer because hw: was busy
 	FFmpegArgs             []string
 	Elapsed                time.Duration
 	Delivered, Device      Stats
