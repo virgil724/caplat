@@ -878,7 +878,7 @@ func (c *Client) handleEvent(objID uint32, opcode uint16, payload []byte) error 
 			}
 			if flags&FeedbackZeroCopy == 0 && !c.warnedZeroCopy {
 				c.warnedZeroCopy = true
-				c.warn("caplat: warning: Wayland compositor did not report ZERO_COPY direct scanout; latency includes compositor compositing")
+				c.warn("caplat: note: compositor did not report ZERO_COPY direct scanout (it composites the barcode); vblank timestamps are still hardware scanout times, so latency numbers are unaffected")
 			}
 			sec := (uint64(secHi) << 32) | uint64(secLo)
 			ns := int64(sec)*1_000_000_000 + int64(nsec)

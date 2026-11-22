@@ -506,8 +506,9 @@ func TestWaylandClientErrorsAndAborts(t *testing.T) {
 		}
 		_ = c.Present(1, func([]byte, int, int) {})
 		_ = c.Present(2, func([]byte, int, int) {})
-		if len(warns) != 1 || !strings.Contains(warns[0], "ZERO_COPY") {
-			t.Errorf("warnings = %v, want 1 ZERO_COPY warning", warns)
+		if len(warns) != 1 || !strings.Contains(warns[0], "ZERO_COPY") ||
+			!strings.Contains(warns[0], "unaffected") || strings.Contains(warns[0], "latency includes") {
+			t.Errorf("warnings = %v, want 1 ZERO_COPY note stating latency numbers are unaffected", warns)
 		}
 		_ = c.Close()
 	})
