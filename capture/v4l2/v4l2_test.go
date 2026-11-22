@@ -819,3 +819,41 @@ func TestListModesVsListAllModes(t *testing.T) {
 		t.Errorf("MJPG FPS = %v, want [60 30]", mjpgFPS)
 	}
 }
+
+func TestSkipLumaDeliversRawOnly(t *testing.T) {
+	const w, h = 64, 32
+	dev := newFakeCaptureDevice("AVT GC553", []fakeFmtSpec{
+		{fourcc: "YUYV", w: w, h: h, fps: [][2]uint32{{1, 60}}},
+	})
+	dev.frameSource = func(seq int, buf []byte) v4l2Buffer {
+		return v4l2Buffer{
+			Flags:         v4l2BufFlagTimestampMonotonic | v4l2BufFlagTstampSrcSOE,
+			TimestampSec:  10,
+			TimestampUsec: int64(seq) * 1000,
+			BytesUsed:     uint32(len(buf)),
+		}
+	}
+	sys := &fakeSystem{
+		nodes: map[string]*fakeV4L2Device{"/dev/video0": dev},
+		files: map[string][]byte{uvcHWTimestampsPath: []byte("0\n")},
+	}
+	got := make(chan capture.Frame, 1)
+	src, err := startWith(sys, Config{Device: "/dev/video0", Width: w, Height: h, FPS: 60, Format: "YUYV", SkipLuma: true},
+		func() int64 { return 10_100_000_000 }, 1_000_000_000, func(f capture.Frame) {
+			select {
+			case got <- f:
+			default:
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { src.Stop(); <-src.Done() }()
+	f := <-got
+	if f.Y != nil {
+		t.Errorf("SkipLuma: Y = %d bytes, want nil", len(f.Y))
+	}
+	if f.FourCC != "YUYV" || f.Pitch < w*2 || len(f.Data) < f.Pitch*h {
+		t.Errorf("SkipLuma: raw view wrong: fourcc %q pitch %d data %d", f.FourCC, f.Pitch, len(f.Data))
+	}
+}

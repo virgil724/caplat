@@ -224,6 +224,11 @@ type Config struct {
 	FPS     float64 // target frame rate; closest supported rate is used
 	Format  string  // "auto", "NV12", "YUYV", "YUY2", "YU12", ...
 	Buffers int     // MMAP buffers to request (clamped to >= 4; default 4)
+	// SkipLuma delivers frames with Y == nil: no per-frame luma plane is
+	// built for packed formats (YUYV/UYVY/RGB). Set it when the consumer only
+	// uses Data (e.g. uploads the picture to a GPU); it saves a full-frame
+	// CPU pass in the capture callback (~4 ms at 1080p YUYV).
+	SkipLuma bool
 }
 
 // Mode is a negotiated or advertised V4L2 capture mode.
@@ -890,7 +895,7 @@ func (s *Source) run(sys v4l2System, path string, cfg Config, now func() int64, 
 
 	w, h := mode.Width, mode.Height
 	var luma []byte
-	if capture.NeedsLumaBuffer(mode.FourCC) {
+	if capture.NeedsLumaBuffer(mode.FourCC) && !cfg.SkipLuma {
 		luma = make([]byte, w*h)
 	}
 
@@ -996,7 +1001,17 @@ func (s *Source) run(sys v4l2System, path string, cfg Config, now func() int64, 
 				}
 			}
 
-			if y, stride, raw, rawPitch, ok := capture.ExtractLuma(mode.FourCC, bufSlice[:used], pitch, w, h, false, luma); ok {
+			var (
+				y, raw           []byte
+				stride, rawPitch int
+				ok               bool
+			)
+			if cfg.SkipLuma {
+				raw, rawPitch, ok = capture.RawView(mode.FourCC, bufSlice[:used], pitch, w, h)
+			} else {
+				y, stride, raw, rawPitch, ok = capture.ExtractLuma(mode.FourCC, bufSlice[:used], pitch, w, h, false, luma)
+			}
+			if ok {
 				f := capture.WithHold(capture.Frame{
 					Y:         y,
 					Stride:    stride,

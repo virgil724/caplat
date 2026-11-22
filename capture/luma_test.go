@@ -257,3 +257,14 @@ func TestExtractLumaBarcodeDecode(t *testing.T) {
 		})
 	}
 }
+
+func TestRawView(t *testing.T) {
+	buf := make([]byte, 8*2*4)
+	raw, pitch, ok := capture.RawView("YUYV", buf, 0, 8, 4)
+	if !ok || pitch != 16 || len(raw) != 64 {
+		t.Fatalf("RawView YUYV = %d bytes pitch %d ok %v", len(raw), pitch, ok)
+	}
+	if _, _, ok := capture.RawView("YUYV", buf[:40], 0, 8, 4); ok {
+		t.Error("RawView accepted a short buffer")
+	}
+}

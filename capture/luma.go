@@ -48,25 +48,11 @@ func RawSize(fourcc string, pitch, h int) int {
 // When bottomUp is true (typical for Windows RGB24/RGB32 DIB buffers), rows are
 // flipped into top-down order so the barcode at the top of the frame sits at row 0 of y.
 func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scratch []byte) (y []byte, stride int, raw []byte, rawPitch int, ok bool) {
-	if w <= 0 || h <= 0 {
+	raw, rawPitch, ok = RawView(fourcc, data, pitch, w, h)
+	if !ok {
 		return nil, 0, nil, 0, false
 	}
-	minPitch := DefaultPitch(fourcc, w)
-	if minPitch == 0 {
-		return nil, 0, nil, 0, false
-	}
-	if pitch <= 0 {
-		pitch = minPitch
-	}
-	if pitch < minPitch {
-		return nil, 0, nil, 0, false
-	}
-	need := RawSize(fourcc, pitch, h)
-	if len(data) < pitch*h {
-		return nil, 0, nil, 0, false
-	}
-	raw = data[:min(len(data), need)]
-	rawPitch = pitch
+	pitch = rawPitch
 
 	switch fourcc {
 	case "NV12", "I420", "IYUV", "YV12", "YU12":
@@ -177,4 +163,26 @@ func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scr
 		return scratch[:w*h], w, raw, rawPitch, true
 	}
 	return nil, 0, nil, 0, false
+}
+
+// RawView validates a driver buffer for fourcc at w x h and returns the
+// picture bytes and row pitch (pitch <= 0 means the format's default pitch)
+// without producing a luma plane. Consumers that upload the raw picture
+// (e.g. to a GPU) and never read Frame.Y use it to skip the per-frame luma
+// conversion.
+func RawView(fourcc string, data []byte, pitch, w, h int) (raw []byte, rawPitch int, ok bool) {
+	if w <= 0 || h <= 0 {
+		return nil, 0, false
+	}
+	minPitch := DefaultPitch(fourcc, w)
+	if minPitch == 0 {
+		return nil, 0, false
+	}
+	if pitch <= 0 {
+		pitch = minPitch
+	}
+	if pitch < minPitch || len(data) < pitch*h {
+		return nil, 0, false
+	}
+	return data[:min(len(data), RawSize(fourcc, pitch, h))], pitch, true
 }
