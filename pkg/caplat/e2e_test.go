@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -62,6 +63,10 @@ type mockPresenter struct {
 	devMS    []float64
 	clock    *atomic.Int64
 
+	frameDelay time.Duration
+	dropAfter  int // 0 = deliver all; <0 = drop all; >0 = stop delivering after N calls
+	calls      int
+
 	band []byte
 	luma []byte
 }
@@ -116,6 +121,13 @@ func (p *mockPresenter) Present(show uint64) error {
 		}
 	}
 	p.clock.Store(arrTick)
+	if p.frameDelay > 0 {
+		time.Sleep(p.frameDelay)
+	}
+	p.calls++
+	if p.dropAfter < 0 || (p.dropAfter > 0 && p.calls > p.dropAfter) {
+		return nil
+	}
 	if onFrame != nil {
 		onFrame(capture.Frame{
 			Y:         p.luma,
@@ -534,4 +546,75 @@ func TestPickEndpointDirectPCM(t *testing.T) {
 	if _, err := pickEndpoint(names, "default", "output", AudioWASAPI); err == nil {
 		t.Errorf("pickEndpoint(default, AudioWASAPI) should reject unknown endpoint")
 	}
+}
+
+func TestStallDetection(t *testing.T) {
+	t.Run("default_deps_timeouts", func(t *testing.T) {
+		d := defaultRunDeps()
+		if d.stallTimeout != 3*time.Second || d.startStallTimeout != 5*time.Second {
+			t.Fatalf("default stall timeouts = (%v, %v), want (3s, 5s)", d.stallTimeout, d.startStallTimeout)
+		}
+	})
+
+	runStallCase := func(t *testing.T, warmup time.Duration, dropAfter int) {
+		t.Helper()
+		const freq = 1_000_000_000
+		var clk atomic.Int64
+		clk.Store(1_000_000_000_000)
+
+		pres := &mockPresenter{
+			capW: 1280, capH: 720,
+			baseTick:   clk.Load(),
+			totMS:      []float64{15.0},
+			devMS:      []float64{8.0},
+			clock:      &clk,
+			frameDelay: 10 * time.Millisecond,
+			dropAfter:  dropAfter,
+		}
+		vb := &mockVideoBackend{
+			disps: []Display{
+				{Name: "DP-2", FriendlyName: "AVT GC553", Width: 1920, Height: 1080, RefreshNum: 60, RefreshDen: 1, LikelyCard: true},
+			},
+			devs: []string{"Live Gamer Ultra-Video"},
+			pres: pres,
+		}
+		start := time.Now()
+		_, err := runWith(context.Background(), Config{
+			Display:       "auto",
+			CaptureWidth:  1280,
+			CaptureHeight: 720,
+			Warmup:        warmup,
+			Duration:      5 * time.Second,
+		}, nil, runDeps{
+			vb:                vb,
+			now:               clk.Load,
+			freq:              freq,
+			drainDelay:        10 * time.Millisecond,
+			stallTimeout:      120 * time.Millisecond,
+			startStallTimeout: 200 * time.Millisecond,
+		})
+		elapsed := time.Since(start)
+		if !errors.Is(err, ErrStalled) {
+			t.Fatalf("err = %v, want ErrStalled", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("stall detection took %v, expected < 1s", elapsed)
+		}
+		if !strings.Contains(err.Error(), "no frames from Live Gamer Ultra-Video for") ||
+			!strings.Contains(err.Error(), "capture card stalled (try replugging its USB / another port)") {
+			t.Errorf("unexpected stall error message: %q", err.Error())
+		}
+	}
+
+	t.Run("no_frames_from_start", func(t *testing.T) {
+		runStallCase(t, 40*time.Millisecond, -1)
+	})
+
+	t.Run("no_frames_during_warmup", func(t *testing.T) {
+		runStallCase(t, 2*time.Second, -1)
+	})
+
+	t.Run("stalls_mid_run", func(t *testing.T) {
+		runStallCase(t, 40*time.Millisecond, 15)
+	})
 }

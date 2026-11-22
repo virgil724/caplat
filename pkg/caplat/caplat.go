@@ -69,6 +69,9 @@ const (
 // Force is not set: the measurement window would cover the desktop.
 var ErrPrimary = errors.New("the chosen display is the primary display; the full-screen barcode would cover your desktop (use --force to do it anyway)")
 
+// ErrStalled is wrapped when the capture device stops delivering frames.
+var ErrStalled = errors.New("capture card stalled")
+
 // Config describes a measurement.
 type Config struct {
 	Backend       string // DefaultBackend() when empty

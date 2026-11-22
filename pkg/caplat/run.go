@@ -3,10 +3,10 @@ package caplat
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/virgil724/caplat/capture"
@@ -57,18 +57,22 @@ func (unsupportedVideoBackend) PrepareCapture(context.Context, Config, Display, 
 func (unsupportedVideoBackend) NewPresenter(string) present.Presenter { return nil }
 
 type runDeps struct {
-	vb         videoBackend
-	now        func() int64
-	freq       int64
-	drainDelay time.Duration
+	vb                videoBackend
+	now               func() int64
+	freq              int64
+	drainDelay        time.Duration
+	stallTimeout      time.Duration // 0 disables stall detection
+	startStallTimeout time.Duration // max wait from stream start before first frame
 }
 
 func defaultRunDeps() runDeps {
 	return runDeps{
-		vb:         newVideoBackend(),
-		now:        capture.Now,
-		freq:       capture.ClockFreq(),
-		drainDelay: 1500 * time.Millisecond,
+		vb:                newVideoBackend(),
+		now:               capture.Now,
+		freq:              capture.ClockFreq(),
+		drainDelay:        1500 * time.Millisecond,
+		stallTimeout:      3 * time.Second,
+		startStallTimeout: 5 * time.Second,
 	}
 }
 
@@ -212,7 +216,12 @@ func runWith(ctx context.Context, cfg Config, updates chan<- Update, deps runDep
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	streamStart := time.Now()
+	var gotFrame atomic.Bool
+	var lastFrameOff atomic.Int64 // nanoseconds since streamStart
 	onFrame := func(f capture.Frame) {
+		lastFrameOff.Store(int64(time.Since(streamStart)))
+		gotFrame.Store(true)
 		code, ok := geo.Decode(f.Y, f.Stride)
 		m.Captured(code, ok, f.QPC, f.DeviceQPC)
 	}
@@ -220,10 +229,41 @@ func runWith(ctx context.Context, cfg Config, updates chan<- Update, deps runDep
 	if err != nil {
 		return res, err
 	}
+	afterStart := time.Now()
 	if mode != "" {
 		res.Setup.CaptureMode = mode
 	}
 	defer src.Stop()
+
+	checkStall := func(t0 time.Time) error {
+		if deps.stallTimeout <= 0 {
+			return nil
+		}
+		if gotFrame.Load() {
+			if time.Since(streamStart)-time.Duration(lastFrameOff.Load()) >= deps.stallTimeout {
+				return fmt.Errorf("no frames from %s for %s — %w (try replugging its USB / another port)", r.setup.Device, deps.stallTimeout, ErrStalled)
+			}
+			return nil
+		}
+		if !t0.IsZero() && time.Since(t0) >= deps.stallTimeout {
+			return fmt.Errorf("no frames from %s for %s — %w (try replugging its USB / another port)", r.setup.Device, deps.stallTimeout, ErrStalled)
+		}
+		startTimeout := deps.startStallTimeout
+		if startTimeout <= 0 {
+			startTimeout = deps.stallTimeout
+		}
+		if time.Since(afterStart) >= startTimeout {
+			return fmt.Errorf("no frames from %s for %s — %w (try replugging its USB / another port)", r.setup.Device, startTimeout, ErrStalled)
+		}
+		return nil
+	}
+
+	var stallCh <-chan time.Time
+	if deps.stallTimeout > 0 {
+		stallTick := time.NewTicker(min(250*time.Millisecond, max(deps.stallTimeout/4, 10*time.Millisecond)))
+		defer stallTick.Stop()
+		stallCh = stallTick.C
+	}
 
 	hz := r.display.RefreshHz()
 	if hz <= 0 {
@@ -245,14 +285,27 @@ func runWith(ctx context.Context, cfg Config, updates chan<- Update, deps runDep
 
 	// Wait for measuring to start (or an early failure).
 	var t0 time.Time
-	select {
-	case t0 = <-started:
-	case err := <-presErr:
-		return res, fmt.Errorf("presenter: %w", err)
-	case err := <-src.Done():
-		cancel()
-		<-presErr
-		return res, fmt.Errorf("capture: %w", err)
+waitStart:
+	for {
+		select {
+		case t0 = <-started:
+			break waitStart
+		case err := <-presErr:
+			if err == nil && ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			return res, fmt.Errorf("presenter: %w", err)
+		case err := <-src.Done():
+			cancel()
+			<-presErr
+			return res, fmt.Errorf("capture: %w", err)
+		case <-stallCh:
+			if serr := checkStall(time.Time{}); serr != nil {
+				cancel()
+				<-presErr
+				return res, serr
+			}
+		}
 	}
 
 	tick := time.NewTicker(time.Second)
@@ -270,6 +323,13 @@ loop:
 			<-presErr
 			runErr = fmt.Errorf("capture stopped early: %w", err)
 			break loop
+		case <-stallCh:
+			if serr := checkStall(t0); serr != nil {
+				cancel()
+				<-presErr
+				runErr = serr
+				break loop
+			}
 		case <-tick.C:
 			el := time.Since(t0)
 			mu.Lock()
@@ -297,7 +357,7 @@ loop:
 
 	// Let the last frames arrive, then stop the capture.
 	m.PresenterStopped()
-	if !errors.Is(runErr, present.ErrAborted) && deps.drainDelay > 0 {
+	if runErr == nil && deps.drainDelay > 0 {
 		time.Sleep(deps.drainDelay)
 	}
 	cancel()
