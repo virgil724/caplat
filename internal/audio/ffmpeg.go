@@ -16,26 +16,55 @@ import (
 // FFmpegRate is the rate ffmpeg resamples to (a no-op for 48 kHz cards).
 const FFmpegRate = 48000
 
-// FFmpegConfig describes an ffmpeg DirectShow audio capture.
+// FFmpegConfig describes an ffmpeg audio capture.
 type FFmpegConfig struct {
-	FFmpeg string // binary; "" = ffmpeg on PATH
-	Device string // DirectShow audio device
+	FFmpeg      string // binary; "" = ffmpeg on PATH
+	InputFormat string // "dshow" (Windows default), "alsa" (Linux default), or "pulse"
+	Device      string // DirectShow audio device or ALSA/Pulse PCM name
 	// LowLatency adds -fflags nobuffer -flags low_delay -probesize 32
-	// -analyzeduration 0 -audio_buffer_size 10; otherwise ffmpeg's defaults.
+	// -analyzeduration 0 (and -audio_buffer_size 10 on dshow); otherwise
+	// ffmpeg's defaults.
 	LowLatency bool
 }
 
 // FFmpegArgs returns ffmpeg's arguments. Output is mono float at 48 kHz,
 // flushed every packet so the pipe adds no buffering of its own.
 func FFmpegArgs(c FFmpegConfig) []string {
+	inFmt := strings.ToLower(c.InputFormat)
+	if inFmt == "" {
+		inFmt = defaultFFmpegInputFormat()
+	}
 	a := []string{"-hide_banner", "-nostdin", "-loglevel", "error"}
 	if c.LowLatency {
-		a = append(a, "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0",
-			"-audio_buffer_size", "10")
+		a = append(a, "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0")
+		if inFmt == "dshow" {
+			a = append(a, "-audio_buffer_size", "10")
+		}
 	}
-	a = append(a, "-f", "dshow", "-i", "audio="+c.Device,
-		"-ac", "1", "-ar", fmt.Sprint(FFmpegRate), "-f", "f32le", "-flush_packets", "1", "pipe:1")
+	switch inFmt {
+	case "alsa":
+		a = append(a, "-f", "alsa", "-i", alsaPCMDevice(c.Device))
+	case "pulse":
+		a = append(a, "-f", "pulse", "-i", c.Device)
+	default:
+		a = append(a, "-f", "dshow", "-i", "audio="+c.Device)
+	}
+	a = append(a, "-ac", "1", "-ar", fmt.Sprint(FFmpegRate), "-f", "f32le", "-flush_packets", "1", "pipe:1")
 	return a
+}
+
+func alsaPCMDevice(dev string) string {
+	if i := strings.LastIndexByte(dev, '('); i >= 0 {
+		if j := strings.LastIndexByte(dev, ')'); j > i+1 {
+			inner := strings.TrimSpace(dev[i+1 : j])
+			if inner == "default" || inner == "pipewire" || inner == "pulse" ||
+				strings.HasPrefix(inner, "hw:") || strings.HasPrefix(inner, "plughw:") ||
+				strings.HasPrefix(inner, "sysdefault:") {
+				return inner
+			}
+		}
+	}
+	return dev
 }
 
 // FFmpegCapture reads audio from an ffmpeg subprocess.

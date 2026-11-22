@@ -19,8 +19,11 @@ type Mode struct {
 }
 
 var (
-	reDevice = regexp.MustCompile(`"([^"]+)" \(video\)`)
-	reMode   = regexp.MustCompile(`(pixel_format|vcodec)=(\S+)\s+min s=(\d+)x(\d+) fps=([\d.]+) max s=(\d+)x(\d+) fps=([\d.]+)`)
+	reDevice       = regexp.MustCompile(`"([^"]+)" \(video\)`)
+	reMode         = regexp.MustCompile(`(pixel_format|vcodec)=(\S+)\s+min s=(\d+)x(\d+) fps=([\d.]+) max s=(\d+)x(\d+) fps=([\d.]+)`)
+	reV4L2Line     = regexp.MustCompile(`(?:Raw|Compressed)\s*:\s*(\S+)\s+:\s+.*?\s+:\s+(.+)$`)
+	reV4L2Discrete = regexp.MustCompile(`\b(\d+)x(\d+)\b`)
+	reV4L2Stepwise = regexp.MustCompile(`\{(\d+)-(\d+),\s*\d+\}x\{(\d+)-(\d+),\s*\d+\}`)
 )
 
 // ParseDevices extracts DirectShow video device names from
@@ -60,6 +63,45 @@ func ParseModes(out string) []Mode {
 	return modes
 }
 
+// ParseV4L2Modes extracts modes from `ffmpeg -hide_banner -f v4l2
+// -list_formats all -i /dev/videoN` output.
+func ParseV4L2Modes(out string) []Mode {
+	var modes []Mode
+	seen := map[Mode]bool{}
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		lm := reV4L2Line.FindStringSubmatch(sc.Text())
+		if lm == nil {
+			continue
+		}
+		format := strings.TrimSpace(lm[1])
+		sizeSpec := lm[2]
+		add := func(md Mode) {
+			if !seen[md] {
+				seen[md] = true
+				modes = append(modes, md)
+			}
+		}
+		for _, m := range reV4L2Stepwise.FindAllStringSubmatch(sizeSpec, -1) {
+			minW, _ := strconv.Atoi(m[1])
+			maxW, _ := strconv.Atoi(m[2])
+			minH, _ := strconv.Atoi(m[3])
+			maxH, _ := strconv.Atoi(m[4])
+			if maxW > 0 && maxH > 0 {
+				add(Mode{Format: format, MinW: minW, MinH: minH, MaxW: maxW, MaxH: maxH})
+			}
+		}
+		for _, m := range reV4L2Discrete.FindAllStringSubmatch(sizeSpec, -1) {
+			w, _ := strconv.Atoi(m[1])
+			h, _ := strconv.Atoi(m[2])
+			if w > 0 && h > 0 {
+				add(Mode{Format: format, MinW: w, MinH: h, MaxW: w, MaxH: h})
+			}
+		}
+	}
+	return modes
+}
+
 // preference ranks raw formats; compressed ones come last.
 var preference = []string{"nv12", "yuyv422", "yuv420p", "uyvy422", "p010le", "rgb24", "bgr24", "bgr0"}
 
@@ -83,7 +125,7 @@ func PickFormat(modes []Mode, w, h int, fps float64) (string, error) {
 		if w < m.MinW || w > m.MaxW || h < m.MinH || h > m.MaxH {
 			continue
 		}
-		if fps > 0 && m.MaxFPS+0.01 < fps {
+		if fps > 0 && m.MaxFPS > 0 && m.MaxFPS+0.01 < fps {
 			continue
 		}
 		if r := rank(m.Format); r < bestRank {
@@ -104,24 +146,4 @@ func run(ctx context.Context, bin string, args ...string) string {
 	// stderr either way.
 	out, _ := exec.CommandContext(ctx, bin, args...).CombinedOutput()
 	return string(out)
-}
-
-// ListDevices returns the DirectShow video capture devices.
-func ListDevices(ctx context.Context, bin string) ([]string, error) {
-	out := run(ctx, bin, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
-	devs := ParseDevices(out)
-	if len(devs) == 0 && !strings.Contains(out, "dshow") {
-		return nil, fmt.Errorf("ffmpeg did not list DirectShow devices (is ffmpeg installed and on PATH?): %s", strings.TrimSpace(out))
-	}
-	return devs, nil
-}
-
-// ListModes returns the modes a device advertises.
-func ListModes(ctx context.Context, bin, device string) ([]Mode, error) {
-	out := run(ctx, bin, "-hide_banner", "-list_options", "true", "-f", "dshow", "-i", "video="+device)
-	modes := ParseModes(out)
-	if len(modes) == 0 {
-		return nil, fmt.Errorf("no modes listed for %q: %s", device, strings.TrimSpace(out))
-	}
-	return modes, nil
 }

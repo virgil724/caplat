@@ -6,6 +6,8 @@ package ffmpeg
 import (
 	"fmt"
 	"strings"
+
+	"github.com/virgil724/caplat/capture/v4l2"
 )
 
 // Presets select ffmpeg's buffering behaviour.
@@ -22,25 +24,29 @@ const (
 // Config describes one capture.
 type Config struct {
 	FFmpeg      string // binary; "" = ffmpeg on PATH
-	Device      string // DirectShow video device name
+	InputFormat string // "dshow" (Windows default) or "v4l2" (Linux default)
+	Device      string // DirectShow video device name or V4L2 device path/name
 	Width       int
 	Height      int
 	FrameRate   string // "60", "60000/1001"
 	PixelFormat string // nv12, yuyv422, mjpeg, ... ("" = let the device pick)
 	Preset      string
-	ExtraIn     []string // inserted before -f dshow
+	ExtraIn     []string // inserted before -f <InputFormat>
 	ExtraOut    []string // inserted after -i
 }
 
 // presetIn and presetOut return the preset's input and output options.
-func presetIn(p string, frameBytes int) ([]string, error) {
+func presetIn(p, inFmt string, frameBytes int) ([]string, error) {
 	switch p {
 	case PresetLowLatency, "":
-		// ~3 frames of real-time buffer, at least 4 MB.
-		mb := max(4, (frameBytes*3+1<<20-1)/(1<<20))
-		return []string{"-fflags", "nobuffer", "-flags", "low_delay",
-			"-probesize", "32", "-analyzeduration", "0",
-			"-rtbufsize", fmt.Sprintf("%dM", mb)}, nil
+		args := []string{"-fflags", "nobuffer", "-flags", "low_delay",
+			"-probesize", "32", "-analyzeduration", "0"}
+		if inFmt == "dshow" {
+			// ~3 frames of real-time buffer, at least 4 MB (dshow demuxer option).
+			mb := max(4, (frameBytes*3+1<<20-1)/(1<<20))
+			args = append(args, "-rtbufsize", fmt.Sprintf("%dM", mb))
+		}
+		return args, nil
 	case PresetDefault:
 		return nil, nil
 	}
@@ -85,26 +91,45 @@ func Args(c Config) ([]string, error) {
 	if c.Width <= 0 || c.Height <= 0 {
 		return nil, fmt.Errorf("bad capture size %dx%d", c.Width, c.Height)
 	}
-	in, err := presetIn(c.Preset, c.Width*c.Height*2)
+	inFmt := strings.ToLower(c.InputFormat)
+	if inFmt == "" {
+		inFmt = defaultInputFormat()
+	}
+	in, err := presetIn(c.Preset, inFmt, c.Width*c.Height*2)
 	if err != nil {
 		return nil, err
 	}
 	a := []string{"-hide_banner", "-nostdin", "-loglevel", "error"}
 	a = append(a, in...)
 	a = append(a, c.ExtraIn...)
-	a = append(a, "-f", "dshow",
-		"-video_size", fmt.Sprintf("%dx%d", c.Width, c.Height))
-	if c.FrameRate != "" {
-		a = append(a, "-framerate", c.FrameRate)
-	}
-	switch pf := strings.ToLower(c.PixelFormat); {
-	case pf == "", pf == "auto":
-	case IsCompressed(pf):
-		a = append(a, "-vcodec", pf)
+	switch inFmt {
+	case "dshow":
+		a = append(a, "-f", "dshow",
+			"-video_size", fmt.Sprintf("%dx%d", c.Width, c.Height))
+		if c.FrameRate != "" {
+			a = append(a, "-framerate", c.FrameRate)
+		}
+		switch pf := strings.ToLower(c.PixelFormat); {
+		case pf == "", pf == "auto":
+		case IsCompressed(pf):
+			a = append(a, "-vcodec", pf)
+		default:
+			a = append(a, "-pixel_format", pf)
+		}
+		a = append(a, "-i", "video="+c.Device)
+	case "v4l2":
+		a = append(a, "-f", "v4l2",
+			"-video_size", fmt.Sprintf("%dx%d", c.Width, c.Height))
+		if c.FrameRate != "" {
+			a = append(a, "-framerate", c.FrameRate)
+		}
+		if pf := strings.ToLower(c.PixelFormat); pf != "" && pf != "auto" {
+			a = append(a, "-input_format", pf)
+		}
+		a = append(a, "-i", v4l2.DevicePath(c.Device))
 	default:
-		a = append(a, "-pixel_format", pf)
+		return nil, fmt.Errorf("unknown ffmpeg input format %q", inFmt)
 	}
-	a = append(a, "-i", "video="+c.Device)
 	a = append(a, presetOut(c.Preset)...)
 	a = append(a, c.ExtraOut...)
 	a = append(a, "-f", "rawvideo", "-pix_fmt", OutputFormat(c.PixelFormat), "pipe:1")
