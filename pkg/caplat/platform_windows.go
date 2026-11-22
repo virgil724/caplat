@@ -13,7 +13,7 @@ import (
 	"github.com/virgil724/caplat/internal/audio"
 	"github.com/virgil724/caplat/internal/capture/dshow"
 	"github.com/virgil724/caplat/internal/capture/ffmpeg"
-	"github.com/virgil724/caplat/internal/displays"
+	"github.com/virgil724/caplat/displays"
 	"github.com/virgil724/caplat/internal/present"
 	"github.com/virgil724/caplat/internal/win"
 )

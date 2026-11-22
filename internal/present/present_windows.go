@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/virgil724/caplat/internal/barcode"
-	"github.com/virgil724/caplat/internal/displays"
+	"github.com/virgil724/caplat/displays"
 	"github.com/virgil724/caplat/internal/win"
 )
 

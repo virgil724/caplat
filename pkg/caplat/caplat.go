@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/virgil724/caplat/internal/capture/ffmpeg"
-	"github.com/virgil724/caplat/internal/displays"
+	"github.com/virgil724/caplat/displays"
 	"github.com/virgil724/caplat/internal/measure"
 	"github.com/virgil724/caplat/internal/present"
 )

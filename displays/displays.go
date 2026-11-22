@@ -2,9 +2,14 @@
 package displays
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrUnsupported is returned by List on operating systems without display
+// enumeration support.
+var ErrUnsupported = errors.New("displays: listing is not supported on this OS")
 
 // Rect is a rectangle in desktop pixel coordinates.
 type Rect struct {
@@ -68,7 +73,10 @@ func contains(name string, hints []string) bool {
 	return false
 }
 
-func likelyCard(name string) bool { return contains(name, cardHints) }
+// LikelyCard reports whether an EDID or device name looks like a capture card.
+func LikelyCard(name string) bool { return contains(name, cardHints) }
+
+func likelyCard(name string) bool { return LikelyCard(name) }
 
 // PickDevice chooses the capture device to measure: the one whose name looks
 // like a capture card, else the only one that is not a virtual camera.

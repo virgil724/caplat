@@ -16,7 +16,7 @@ import (
 	"github.com/virgil724/caplat/capture"
 	"github.com/virgil724/caplat/internal/audio"
 	"github.com/virgil724/caplat/internal/barcode"
-	"github.com/virgil724/caplat/internal/displays"
+	"github.com/virgil724/caplat/displays"
 	"github.com/virgil724/caplat/internal/present"
 )
 
