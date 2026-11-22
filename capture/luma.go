@@ -4,7 +4,7 @@ package capture
 // buffer to extract an 8-bit luma plane for Frame.Y.
 func NeedsLumaBuffer(fourcc string) bool {
 	switch fourcc {
-	case "NV12", "I420", "IYUV", "YV12":
+	case "NV12", "I420", "IYUV", "YV12", "YU12":
 		return false
 	default:
 		return true
@@ -15,13 +15,13 @@ func NeedsLumaBuffer(fourcc string) bool {
 // width w, or 0 for unknown formats.
 func DefaultPitch(fourcc string, w int) int {
 	switch fourcc {
-	case "NV12", "I420", "IYUV", "YV12":
+	case "NV12", "I420", "IYUV", "YV12", "YU12":
 		return w
-	case "YUY2", "UYVY", "P010":
+	case "YUY2", "YUYV", "UYVY", "P010":
 		return w * 2
-	case "RGB24":
+	case "RGB24", "BGR3", "RGB3":
 		return w * 3
-	case "RGB32":
+	case "RGB32", "BGR4", "XR24":
 		return w * 4
 	}
 	return 0
@@ -31,9 +31,9 @@ func DefaultPitch(fourcc string, w int) int {
 // and height h, or 0 for unknown formats.
 func RawSize(fourcc string, pitch, h int) int {
 	switch fourcc {
-	case "NV12", "I420", "IYUV", "YV12", "P010":
+	case "NV12", "I420", "IYUV", "YV12", "YU12", "P010":
 		return pitch * h * 3 / 2
-	case "YUY2", "UYVY", "RGB24", "RGB32":
+	case "YUY2", "YUYV", "UYVY", "RGB24", "BGR3", "RGB3", "RGB32", "BGR4", "XR24":
 		return pitch * h
 	}
 	return 0
@@ -42,11 +42,11 @@ func RawSize(fourcc string, pitch, h int) int {
 // ExtractLuma populates an 8-bit top-down luma plane (y, stride) and slices
 // raw to the frame's byte range.
 //
-// For 8-bit 4:2:0 planar formats (NV12, I420, IYUV, YV12) y aliases data
-// directly with zero copy. For P010, YUY2, UYVY, RGB24, and RGB32, luma is
-// written into scratch (which must have len >= w*h). When bottomUp is true
-// (typical for Windows RGB24/RGB32 DIB buffers), rows are flipped into
-// top-down order so the barcode at the top of the frame sits at row 0 of y.
+// For 8-bit 4:2:0 planar formats (NV12, I420, IYUV, YV12, YU12) y aliases data
+// directly with zero copy. For P010, YUY2, YUYV, UYVY, RGB24, BGR3, RGB3,
+// RGB32, BGR4, and XR24, luma is written into scratch (which must have len >= w*h).
+// When bottomUp is true (typical for Windows RGB24/RGB32 DIB buffers), rows are
+// flipped into top-down order so the barcode at the top of the frame sits at row 0 of y.
 func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scratch []byte) (y []byte, stride int, raw []byte, rawPitch int, ok bool) {
 	if w <= 0 || h <= 0 {
 		return nil, 0, nil, 0, false
@@ -69,7 +69,7 @@ func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scr
 	rawPitch = pitch
 
 	switch fourcc {
-	case "NV12", "I420", "IYUV", "YV12":
+	case "NV12", "I420", "IYUV", "YV12", "YU12":
 		return data[:pitch*h], pitch, raw, rawPitch, true
 
 	case "P010":
@@ -87,7 +87,7 @@ func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scr
 		}
 		return scratch[:w*h], w, raw, rawPitch, true
 
-	case "YUY2":
+	case "YUY2", "YUYV":
 		if len(scratch) < w*h {
 			return nil, 0, nil, 0, false
 		}
@@ -113,7 +113,7 @@ func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scr
 		}
 		return scratch[:w*h], w, raw, rawPitch, true
 
-	case "RGB24":
+	case "RGB24", "BGR3":
 		// BGR 24-bit (B, G, R). BT.709 integer luma: (54*R + 183*G + 19*B) >> 8.
 		if len(scratch) < w*h {
 			return nil, 0, nil, 0, false
@@ -134,7 +134,28 @@ func ExtractLuma(fourcc string, data []byte, pitch, w, h int, bottomUp bool, scr
 		}
 		return scratch[:w*h], w, raw, rawPitch, true
 
-	case "RGB32":
+	case "RGB3":
+		// RGB 24-bit (R, G, B). BT.709 integer luma: (54*R + 183*G + 19*B) >> 8.
+		if len(scratch) < w*h {
+			return nil, 0, nil, 0, false
+		}
+		for row := 0; row < h; row++ {
+			srcRow := row
+			if bottomUp {
+				srcRow = h - 1 - row
+			}
+			src := data[srcRow*pitch : srcRow*pitch+w*3]
+			dst := scratch[row*w : row*w+w]
+			for x := 0; x < w; x++ {
+				r := int(src[3*x])
+				g := int(src[3*x+1])
+				b := int(src[3*x+2])
+				dst[x] = byte((54*r + 183*g + 19*b) >> 8)
+			}
+		}
+		return scratch[:w*h], w, raw, rawPitch, true
+
+	case "RGB32", "BGR4", "XR24":
 		// BGRX 32-bit (B, G, R, X).
 		if len(scratch) < w*h {
 			return nil, 0, nil, 0, false

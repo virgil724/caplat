@@ -49,6 +49,8 @@ const (
 	// BackendDShow reads it in-process with DirectShow (capture filter ->
 	// SampleGrabber -> NullRenderer, no graph clock), without ffmpeg.
 	BackendDShow = "dshow"
+	// BackendV4L2 reads it in-process on Linux via V4L2 MMAP ioctls.
+	BackendV4L2 = "v4l2"
 )
 
 // ErrPrimary is returned when the chosen display is the primary one and

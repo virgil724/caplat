@@ -46,6 +46,19 @@ func TestExtractLumaBarcodeDecode(t *testing.T) {
 			},
 		},
 		{
+			name:   "YU12_padded",
+			fourcc: "YU12", padBytes: 16,
+			build: func(pitch int) []byte {
+				buf := make([]byte, pitch*h*3/2)
+				for y := 0; y < h; y++ {
+					for x := 0; x < w; x++ {
+						buf[y*pitch+x] = pixelVal(x, y)
+					}
+				}
+				return buf
+			},
+		},
+		{
 			name:   "P010_padded",
 			fourcc: "P010", padBytes: 32,
 			build: func(pitch int) []byte {
@@ -73,6 +86,69 @@ func TestExtractLumaBarcodeDecode(t *testing.T) {
 					for x := 0; x < w; x++ {
 						buf[y*pitch+2*x] = pixelVal(x, y)
 						buf[y*pitch+2*x+1] = 128
+					}
+				}
+				return buf
+			},
+		},
+		{
+			name:   "YUYV",
+			fourcc: "YUYV", padBytes: 16,
+			build: func(pitch int) []byte {
+				buf := make([]byte, pitch*h)
+				for y := 0; y < h; y++ {
+					for x := 0; x < w; x++ {
+						buf[y*pitch+2*x] = pixelVal(x, y)
+						buf[y*pitch+2*x+1] = 128
+					}
+				}
+				return buf
+			},
+		},
+		{
+			name:   "BGR3_topdown",
+			fourcc: "BGR3", padBytes: 4, bottomUp: false,
+			build: func(pitch int) []byte {
+				buf := make([]byte, pitch*h)
+				for y := 0; y < h; y++ {
+					for x := 0; x < w; x++ {
+						v := pixelVal(x, y)
+						buf[y*pitch+3*x] = v
+						buf[y*pitch+3*x+1] = v
+						buf[y*pitch+3*x+2] = v
+					}
+				}
+				return buf
+			},
+		},
+		{
+			name:   "RGB3_topdown",
+			fourcc: "RGB3", padBytes: 4, bottomUp: false,
+			build: func(pitch int) []byte {
+				buf := make([]byte, pitch*h)
+				for y := 0; y < h; y++ {
+					for x := 0; x < w; x++ {
+						v := pixelVal(x, y)
+						buf[y*pitch+3*x] = v
+						buf[y*pitch+3*x+1] = v
+						buf[y*pitch+3*x+2] = v
+					}
+				}
+				return buf
+			},
+		},
+		{
+			name:   "XR24_topdown",
+			fourcc: "XR24", padBytes: 16, bottomUp: false,
+			build: func(pitch int) []byte {
+				buf := make([]byte, pitch*h)
+				for y := 0; y < h; y++ {
+					for x := 0; x < w; x++ {
+						v := pixelVal(x, y)
+						buf[y*pitch+4*x] = v
+						buf[y*pitch+4*x+1] = v
+						buf[y*pitch+4*x+2] = v
+						buf[y*pitch+4*x+3] = 255
 					}
 				}
 				return buf
