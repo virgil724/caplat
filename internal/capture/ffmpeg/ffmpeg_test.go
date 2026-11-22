@@ -7,7 +7,7 @@ import (
 
 func TestArgsLowLatency(t *testing.T) {
 	a, err := Args(Config{Device: "Live Gamer Ultra-Video", Width: 1280, Height: 720,
-		FrameRate: "60000/1001", PixelFormat: "nv12", Preset: PresetLowLatency})
+		FrameRate: "60000/1001", PixelFormat: "nv12", Preset: PresetLowLatency, InputFormat: "dshow"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func TestArgsLowLatency(t *testing.T) {
 
 func TestArgsDefaultAndMJPEG(t *testing.T) {
 	a, _ := Args(Config{Device: "Cam", Width: 1920, Height: 1080, FrameRate: "60",
-		PixelFormat: "mjpeg", Preset: PresetDefault, ExtraIn: []string{"-x", "1"}, ExtraOut: []string{"-y", "2"}})
+		PixelFormat: "mjpeg", Preset: PresetDefault, InputFormat: "dshow", ExtraIn: []string{"-x", "1"}, ExtraOut: []string{"-y", "2"}})
 	got := strings.Join(a, " ")
 	if strings.Contains(got, "nobuffer") || strings.Contains(got, "passthrough") {
 		t.Errorf("default preset added low-latency options: %s", got)

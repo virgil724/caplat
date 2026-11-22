@@ -2,3 +2,5 @@
 *.csv
 /gui/build/
 *.exe~
+/caplat
+/gui/gui

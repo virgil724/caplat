@@ -198,7 +198,14 @@ func (d *puregoDriver) Configure(h pcmHandle, cfg hwConfig, isPlayback bool) (ne
 	}
 
 	var chosenFmt int32 = -1
-	for _, f := range []int32{FormatFloatLE, FormatS32LE, FormatS24LE, FormatS24_3LE, FormatS16LE} {
+	formats := []int32{FormatFloatLE, FormatS32LE, FormatS24LE, FormatS24_3LE, FormatS16LE}
+	if isPlayback {
+		// S16LE is what every HDMI / capture-card sink accepts and what
+		// ffmpeg's alsa demuxer defaults to; snd-aloop forces the capture
+		// side to whatever the playback side opened.
+		formats = []int32{FormatS16LE, FormatS32LE, FormatS24LE, FormatS24_3LE, FormatFloatLE}
+	}
+	for _, f := range formats {
 		if d.lib.fnHWParamsSetFormat(p.pcm, hw, f) >= 0 {
 			chosenFmt = f
 			break

@@ -226,6 +226,11 @@ func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioRe
 
 	// Pair detections with the chirp played last before them.
 	maxLag := int64(0.45 * float64(freq))
+	// A driver capture timestamp can read slightly before the player's
+	// clock reading on a ~zero-latency path (e.g. snd-aloop), because the
+	// two are sampled at different points; allow a small negative slack
+	// instead of silently dropping the detection.
+	devSlack := int64(0.005 * float64(freq))
 	match := func(final bool) {
 		cutoff := deps.now() - int64(0.3*float64(freq))
 		mu.Lock()
@@ -243,7 +248,7 @@ func runAudioWith(ctx context.Context, cfg AudioConfig, deps audioDeps) (AudioRe
 			}
 			best := -1
 			for i, e := range emitted {
-				if e.QPC <= ref && ref-e.QPC < maxLag {
+				if e.QPC <= ref+devSlack && ref-e.QPC < maxLag {
 					best = i
 				}
 			}
