@@ -22,6 +22,22 @@ var v4l2FormatNames = map[string]string{
 	"H264": "h264",
 }
 
+// mergeModes returns primary plus the entries of extra whose format does not
+// appear in primary (e.g. mjpeg, which only the ffmpeg backend can decode).
+func mergeModes(primary, extra []Mode) []Mode {
+	have := map[string]bool{}
+	for _, m := range primary {
+		have[m.Format] = true
+	}
+	out := primary
+	for _, m := range extra {
+		if !have[m.Format] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // modesFromV4L2 converts V4L2 discrete modes into Mode entries (one size and
 // frame rate each), keeping only the highest frame rate per format and size.
 func modesFromV4L2(ms []v4l2.Mode) []Mode {

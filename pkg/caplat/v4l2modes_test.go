@@ -26,3 +26,15 @@ func TestModesFromV4L2(t *testing.T) {
 		t.Errorf("unknown fourcc should be lowercased, got %q", got[2].Format)
 	}
 }
+
+func TestMergeModesKeepsFFmpegOnlyFormats(t *testing.T) {
+	primary := []Mode{{Format: "yuyv422", MaxW: 640, MaxH: 480, MaxFPS: 30}}
+	extra := []Mode{
+		{Format: "yuyv422", MaxW: 640, MaxH: 480},
+		{Format: "mjpeg", MinW: 640, MinH: 360, MaxW: 1920, MaxH: 1080},
+	}
+	got := mergeModes(primary, extra)
+	if len(got) != 2 || got[0].MaxFPS != 30 || got[1].Format != "mjpeg" {
+		t.Fatalf("mergeModes = %+v", got)
+	}
+}
